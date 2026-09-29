@@ -8,8 +8,10 @@
  * - min/max/first/last 基于累加器的窗口区间扫描（V1 数据量下足够）；
  * - 就绪性：连接连续接收时长 ≥ 窗口长度，窗口才被认为是完整的，
  *   否则值为 null，避免启动/重连后用残缺窗口误触发。
+ * - ticker 指标不走这套累加：24h 统计由交易所算好后每秒下发，收到第一条即可用，
+ *   既不受 60s 窗口上限约束，也不需要预热。
  */
-import type { MetricDef, WindowMetric } from '../../shared/dsl.ts';
+import type { MetricDef, TickerMetric, WindowMetric } from '../../shared/dsl.ts';
 import { windowMs } from '../../shared/dsl.ts';
 
 export interface Trade {
@@ -21,6 +23,29 @@ export interface Trade {
   q: number;
   /** buyer is maker：true = 主动卖，false = 主动买 */
   m: boolean;
+}
+
+/**
+ * Binance `<symbol>@ticker` 的 24h 滚动统计快照。
+ * 与 Trade 不同：这是交易所已经算好的终值，收到即有效，本地不做任何聚合。
+ */
+export interface Ticker {
+  /** 事件时间 E（ms） */
+  E: number;
+  /** c：最新成交价 */
+  last: number;
+  /** h：24h 最高价 */
+  high: number;
+  /** l：24h 最低价 */
+  low: number;
+  /** p：24h 涨跌额 */
+  change: number;
+  /** P：24h 涨跌幅，已由百分数转为小数（2.345% → 0.02345），与 DSL 百分比约定一致 */
+  changePct: number;
+  /** v：24h 成交量（base 币） */
+  volume: number;
+  /** q：24h 成交额（quote 币） */
+  quoteVolume: number;
 }
 
 type Field = WindowMetric['field'];
@@ -54,6 +79,8 @@ export class SymbolWindows {
   private maxWindowMs = 60_000;
   /** 当前连续接收区间的起点（交易所时间）；null 表示未连接 */
   private continuousSince: number | null = null;
+  /** 最近一条 24h ticker 快照；收到第一条之前所有 ticker 指标为 null */
+  private tickerSnap: Ticker | null = null;
   now = 0;
   lastTrade: Trade | null = null;
 
@@ -63,6 +90,14 @@ export class SymbolWindows {
   }
   markDisconnected() {
     this.continuousSince = null;
+  }
+
+  pushTicker(t: Ticker) {
+    this.tickerSnap = t;
+  }
+
+  get ticker24h() {
+    return this.tickerSnap;
   }
 
   private accFor(m: WindowMetric) {
@@ -179,12 +214,31 @@ export class SymbolWindows {
     }
   }
 
+  /** ticker 指标：交易所侧 24h 终值，没有预热；未收到第一条快照时为 null */
+  tickerValue(m: TickerMetric): MetricValue {
+    const t = this.tickerSnap;
+    if (!t) return null;
+    switch (m.field) {
+      case 'last_price': return t.last;
+      case 'high_24h': return t.high;
+      case 'low_24h': return t.low;
+      case 'change_24h': return t.change;
+      case 'change_pct_24h': return t.changePct;
+      case 'volume_24h': return t.volume;
+      case 'quote_volume_24h': return t.quoteVolume;
+    }
+  }
+
   /** 按定义顺序计算一组指标（combine 只引用在其之前的指标） */
   evaluate(defs: MetricDef[]): Record<string, MetricValue> {
     const out: Record<string, MetricValue> = {};
     for (const d of defs) {
       if (d.kind === 'window') {
         out[d.name] = this.window(d);
+        continue;
+      }
+      if (d.kind === 'ticker') {
+        out[d.name] = this.tickerValue(d);
         continue;
       }
       const a = out[d.a];

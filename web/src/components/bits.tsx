@@ -30,22 +30,28 @@ export function Section({ label, children, right }: { label: string; children: R
   );
 }
 
+/** 指标一行摘要：窗口指标看窗口+聚合，ticker 指标看字段，combine 看算子 */
+const metricKindLabel = (m: MetricDef) =>
+  m.kind === 'window' ? `${m.window} · ${m.aggregation}` : m.kind === 'ticker' ? `24h · ${m.field}` : m.op;
+
+const metricStreams = (metrics: MetricDef[]) => [...new Set(metrics.flatMap((m) => (m.kind === 'combine' ? [] : [m.stream])))];
+
 export function MetricLine({ m, all, value, symbol }: { m: MetricDef; all: MetricDef[]; value?: number | null; symbol: string }) {
   return (
     <details className="metric-line">
       <summary>
         <code>{m.name}</code>
         {value !== undefined && <span className="metric-value">{fmtNum(value, metricUnit(m, all))}</span>}
-        <span className="muted small">{m.kind === 'window' ? `${m.window} · ${m.aggregation}` : m.op}</span>
+        <span className="muted small">{metricKindLabel(m)}</span>
       </summary>
-      <pre className="formula">{describeFormula(m)}{m.kind === 'window' ? `\n\nSource  ${symbol} @ ${m.stream}` : ''}</pre>
+      <pre className="formula">{describeFormula(m)}{m.kind === 'combine' ? '' : `\n\nSource  ${symbol} @ ${m.stream}`}</pre>
     </details>
   );
 }
 
 /** Create / Detail 共用的结构化展示：SOURCE / METRICS / CONDITION / ACTION */
 export function SpecView({ spec, values, action }: { spec: SignalSpec; values?: Record<string, number | null>; action?: ReactNode }) {
-  const streams = [...new Set(spec.metrics.flatMap((m) => (m.kind === 'window' ? [m.stream] : [])))];
+  const streams = metricStreams(spec.metrics);
   return (
     <div className="spec-grid">
       <Section label="Source">
@@ -88,6 +94,7 @@ export function ExplainPanel({ event, deliveries }: { event: EventRow; deliverie
     return m ? metricUnit(m, spec.metrics) : '';
   };
   const windows = [...new Set(spec.metrics.flatMap((m) => (m.kind === 'window' ? [m.window] : [])))];
+  const streams = metricStreams(spec.metrics);
   return (
     <div className="explain">
       <h3>Why did this trigger?</h3>
@@ -116,7 +123,7 @@ export function ExplainPanel({ event, deliveries }: { event: EventRow; deliverie
       ))}
       <div className="kv">
         <span>Source</span>
-        <span className="mono">{event.symbol} @ aggTrade</span>
+        <span className="mono">{event.symbol} @ {streams.join(' + ') || 'aggTrade'}</span>
         <span>Window</span>
         <span className="mono">{windows.join(', ')}</span>
         <span>Trigger Time</span>

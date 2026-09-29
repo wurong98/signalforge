@@ -11,8 +11,8 @@ import type { BinanceHub } from '../binance/stream.ts';
 import type { Db, EventRow, SignalRow } from '../db.ts';
 import type { WebhookDispatcher } from '../webhook/delivery.ts';
 import type { EvalResult, SignalState } from './signal.ts';
-import { SignalStateMachine, evaluateCondition, gauge, requiredWindowMs } from './signal.ts';
-import type { MetricValue, Trade } from './window.ts';
+import { SignalStateMachine, evaluateCondition, gauge, requiresTicker, requiredWindowMs } from './signal.ts';
+import type { MetricValue, Ticker, Trade } from './window.ts';
 import { SymbolWindows } from './window.ts';
 
 const TICK_MS = 200;
@@ -70,9 +70,11 @@ class Runner {
   ready = false;
   error: string | null = null;
   readonly needMs: number;
+  readonly needTicker: boolean;
   constructor(public row: SignalRow, lastEventTs: number | null) {
     this.sm = new SignalStateMachine(row.spec.cooldown_ms);
     this.needMs = requiredWindowMs(row.spec);
+    this.needTicker = requiresTicker(row.spec);
     this.lastEventTs = lastEventTs;
   }
 }
@@ -94,6 +96,8 @@ export class Runtime extends EventEmitter {
   ) {
     super();
     hub.on('trade', (s, t, E, recv) => this.onTrade(s, t, E, recv));
+    // ticker 不参与成交窗口的时钟与预热，只更新 24h 快照后立刻重算（边沿要抓得准）
+    hub.on('ticker', (s, t) => this.onTicker(s, t));
     hub.on('connected', (symbols) => {
       for (const s of symbols) {
         const c = this.clock(s);
@@ -196,6 +200,13 @@ export class Runtime extends EventEmitter {
     this.evaluateSymbol(symbol);
   }
 
+  private onTicker(symbol: string, t: Ticker) {
+    const w = this.windows.get(symbol);
+    if (!w) return;
+    w.pushTicker(t);
+    this.evaluateSymbol(symbol);
+  }
+
   private tick() {
     for (const [s, w] of this.windows) w.advance(this.nowEx(s));
     this.evaluateAll();
@@ -203,6 +214,11 @@ export class Runtime extends EventEmitter {
 
   private evaluateAll() {
     for (const s of this.windows.keys()) this.evaluateSymbol(s);
+  }
+
+  /** 就绪 = 窗口已预热完；若 spec 用到 24h ticker，还须已收到第一条 ticker 快照 */
+  private readyOf(r: Runner, w: SymbolWindows) {
+    return w.ready(r.needMs) && (!r.needTicker || w.ticker24h !== null);
   }
 
   private evaluateSymbol(symbol: string) {
@@ -214,7 +230,7 @@ export class Runtime extends EventEmitter {
         const now = w.now;
         r.values = w.evaluate(r.row.spec.metrics);
         r.result = evaluateCondition(r.row.spec.condition, r.values);
-        r.ready = w.ready(r.needMs);
+        r.ready = this.readyOf(r, w);
         r.lastEvalLocal = Date.now();
         r.error = null;
         const tr = r.sm.step(now, r.ready, r.result.passed);
@@ -333,7 +349,8 @@ export class Runtime extends EventEmitter {
     const w = this.windows.get(spec.market.symbol);
     if (!w) return { subscribed: false, ready: false, values: {}, result: null };
     const values = w.evaluate(spec.metrics);
-    return { subscribed: true, ready: w.ready(requiredWindowMs(spec)), values, result: evaluateCondition(spec.condition, values) };
+    const ready = w.ready(requiredWindowMs(spec)) && (!requiresTicker(spec) || w.ticker24h !== null);
+    return { subscribed: true, ready, values, result: evaluateCondition(spec.condition, values) };
   }
 
   status(id: number): RunnerStatus | null {
@@ -366,12 +383,16 @@ export class Runtime extends EventEmitter {
   }
 
   symbols() {
-    return [...this.windows.entries()].map(([symbol, w]) => ({
-      symbol,
-      ready_60s: w.ready(60_000),
-      buffer: w.bufferSize,
-      last_trade: w.lastTrade,
-      exchange_now: w.now,
-    }));
+    return [...this.windows.entries()].map(([symbol, w]) => {
+      const t = w.ticker24h;
+      return {
+        symbol,
+        ready_60s: w.ready(60_000),
+        buffer: w.bufferSize,
+        last_trade: w.lastTrade,
+        exchange_now: w.now,
+        ticker_24h: t ? { last: t.last, high: t.high, low: t.low, change_pct: t.changePct, E: t.E } : null,
+      };
+    });
   }
 }

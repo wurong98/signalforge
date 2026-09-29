@@ -138,3 +138,13 @@ export function requiredWindowMs(spec: SignalSpec): number {
   for (const m of spec.metrics) if (m.kind === 'window') ms = Math.max(ms, Number(m.window.slice(0, -1)) * 1000);
   return ms;
 }
+
+/**
+ * spec 是否依赖 24h ticker。
+ * 依赖时必须等到第一条 ticker 到达才算就绪：否则就绪瞬间 ticker 还是 null（条件假 → ARMED），
+ * 下一秒 ticker 到达、条件转真，会被误判成"由假变真"的边沿而触发——这正是启动时已满足的条件。
+ * 等到 ticker 就绪后再看条件，才能保证"启动时已满足不触发"（PRD §23）在长周期指标上同样成立。
+ */
+export function requiresTicker(spec: SignalSpec): boolean {
+  return spec.metrics.some((m) => m.kind === 'ticker');
+}

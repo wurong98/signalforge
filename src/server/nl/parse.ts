@@ -4,7 +4,7 @@
  * 校验失败会把错误回灌给 LLM 修复一次，仍失败则回落到规则解析器。
  */
 import { CATALOG } from '../../shared/catalog.ts';
-import { AGGREGATIONS, COMBINE_OPS, FIELDS, OPERATORS, WINDOWS, validateSpec } from '../../shared/dsl.ts';
+import { AGGREGATIONS, COMBINE_OPS, FIELDS, OPERATORS, TICKER_FIELDS, WINDOWS, validateSpec } from '../../shared/dsl.ts';
 import type { ParseOutput } from './rules.ts';
 import { parseWithRules } from './rules.ts';
 
@@ -14,13 +14,18 @@ export interface LlmConfig {
   model: string;
 }
 
+const MAX_WINDOW = WINDOWS[WINDOWS.length - 1];
+
 const SYSTEM_PROMPT = `You convert a user's natural-language market-monitoring request into a Signal DSL JSON for Binance Spot real-time data.
 You NEVER decide at runtime whether a signal fires; you only produce a structured definition.
 
-Available data (V1): only the Binance Spot "aggTrade" stream. Fields: p=price, q=quantity, T=trade time, m=buyer_is_maker.
-- Aggressive BUY (taker buy) = buyer_is_maker:false. Aggressive SELL (taker sell) = buyer_is_maker:true.
-- "notional" = price × quantity (in quote currency, e.g. USDT).
-Depth / order book / bookTicker are NOT available in V1 — if the user asks for them, say so in "unsupported".
+Available data — two Binance Spot public streams:
+1. "aggTrade" (window metrics, max ${MAX_WINDOW}): p=price, q=quantity, T=trade time, m=buyer_is_maker.
+   - Aggressive BUY (taker buy) = buyer_is_maker:false. Aggressive SELL (taker sell) = buyer_is_maker:true.
+   - "notional" = price × quantity (in quote currency, e.g. USDT).
+2. "ticker" (24h rolling statistics, computed by the exchange and pushed every second — usable the moment it arrives, no warmup):
+   c=last price, h=24h high, l=24h low, p=24h change, P=24h change percent, v=24h base volume, q=24h quote volume.
+Depth / order book are NOT available — if the user asks for them, say so in "unsupported".
 
 DSL schema (TypeScript):
 type Spec = {
@@ -36,6 +41,7 @@ type Metric =
   | { name: string; kind: "window"; stream: "aggTrade"; window: ${WINDOWS.map((w) => `"${w}"`).join('|')};
       filter: { buyer_is_maker?: boolean }; field: ${FIELDS.map((f) => `"${f}"`).join('|')};
       aggregation: ${AGGREGATIONS.map((a) => `"${a}"`).join('|')} }   // "return" = (last-first)/first, price only; "delta" = last-first, price only
+  | { name: string; kind: "ticker"; stream: "ticker"; field: ${TICKER_FIELDS.map((f) => `"${f}"`).join('|')} }  // 24h rolling stat, see mapping below
   | { name: string; kind: "combine"; op: ${COMBINE_OPS.map((o) => `"${o}"`).join('|')}; a: string; b: string }; // ratio=a/b, imbalance=(a-b)/(a+b), diff=a-b
 type Condition =
   | { left: string /* metric name */; operator: ${OPERATORS.map((o) => `"${o}"`).join('|')};
@@ -43,15 +49,33 @@ type Condition =
   | { op: "and" | "or"; conditions: Condition[] };
 Metric names: ^[a-z][a-z0-9_]{0,63}$. Percentages are fractions: 0.1% => 0.001.
 
+ticker field mapping: last_price=c, high_24h=h, low_24h=l, change_24h=p, change_pct_24h=P, volume_24h=v, quote_volume_24h=q.
+change_pct_24h is stored as a FRACTION (P = "2.345" => 0.02345), same rule as "return".
+
 Conventions (prefer these names when they fit): ${CATALOG.filter((m) => m.name.endsWith('_10s') || m.name === 'last_price').map((m) => m.name).join(', ')} (same pattern for other windows).
 For "A is N times B", use { left: A, operator: ">", right: { metric: B, multiplier: N } } — NEVER create a ratio metric for this (a ratio is undefined when B = 0).
 Noise floor: a relative comparison (A > B × N) also fires on tiny volume (e.g. $10 buy vs $0 sell). Unless the user gave an absolute
 threshold, wrap it as { op: "and", conditions: [ <the comparison>, { left: A, operator: ">=", right: { value: FLOOR } } ] } where FLOOR is
 50000 USDT for BTC, 20000 for ETH, 5000 otherwise (scale linearly with window: that's for 10s), and state this floor in assumptions.
 Windows must be one of ${WINDOWS.join(', ')}; if the user asks for another length, pick the nearest and add an assumption.
+
+Long periods — a window metric can NEVER exceed ${MAX_WINDOW}. Any 24h / daily request MUST use kind:"ticker"; never silently
+downgrade it to a short window, that is a different signal:
+- "24h new low"  => metrics [ last_1s = window(aggTrade, 1s, price, last), low_24h = ticker.low_24h ],
+                     condition { left: "last_1s", operator: "<", right: { metric: "low_24h", multiplier: 1 } }.
+  A fresh trade printing strictly below the ticker's last published low IS the instant a new low is made; the ticker then
+  catches up and the condition goes false again — so every new low is a clean false→true edge and cooldown does the rate
+  limiting. Use STRICT inequality: "<=" would stay true for the whole slide and fire only once.
+- "24h new high" => same, with high_24h and ">".
+- "24h change exceeds N%" => ticker.change_pct_24h >= N/100 (or the two-sided OR when the user just said "涨跌幅"), no window metric needed.
+- "24h volume above X" => ticker.quote_volume_24h >= X.
+Add an assumption that it triggers once per new high/low edge, rate-limited by cooldown_ms, whenever the user asked for a limit
+("every minute" => cooldown_ms 60000). Mix freely: an AND of a ticker threshold and a window metric expresses "24h volume high AND
+a 10s spike".
+
 Only if no symbol/coin is mentioned at all, use BTCUSDT and add an assumption. Do not list trivial assumptions (e.g. unit conversions).
 
-Example — input: "BTC 最近 10 秒主动买入金额超过主动卖出金额 3 倍时调用我的 webhook"
+Example 1 — input: "BTC 最近 10 秒主动买入金额超过主动卖出金额 3 倍时调用我的 webhook"
 {"spec":{"name":"btc-buy-pressure-10s","title":"BTC Buy Pressure 10s","description":"BTC 10 秒主动买入额超过主动卖出额 3 倍",
 "market":{"exchange":"binance","product":"spot","symbol":"BTCUSDT"},
 "metrics":[{"name":"buy_notional_10s","kind":"window","stream":"aggTrade","window":"10s","filter":{"buyer_is_maker":false},"field":"notional","aggregation":"sum"},
@@ -60,6 +84,15 @@ Example — input: "BTC 最近 10 秒主动买入金额超过主动卖出金额 
 {"left":"buy_notional_10s","operator":">=","right":{"value":50000}}]},"cooldown_ms":10000},
 "explanation":"基于 BTCUSDT aggTrade：统计最近 10 秒主动买入成交额 Σ(p×q | m=false) 与主动卖出成交额 Σ(p×q | m=true)，当买入额 > 卖出额 × 3 时触发。",
 "assumptions":["为避免成交稀少时误触发，额外要求 10 秒主动买入额 ≥ 50,000 USDT（可修改）"],"unsupported":null}
+
+Example 2 — input: "BTC 创 24 小时新低时提醒我，每分钟最多一次"
+{"spec":{"name":"btc-24h-new-low","title":"BTC 24h New Low","description":"BTC 跌破 24 小时最低价时提醒，每分钟最多一次",
+"market":{"exchange":"binance","product":"spot","symbol":"BTCUSDT"},
+"metrics":[{"name":"last_1s","kind":"window","stream":"aggTrade","window":"1s","filter":{},"field":"price","aggregation":"last"},
+{"name":"low_24h","kind":"ticker","stream":"ticker","field":"low_24h"}],
+"condition":{"left":"last_1s","operator":"<","right":{"metric":"low_24h","multiplier":1}},"cooldown_ms":60000},
+"explanation":"aggTrade 取最近 1 秒最新成交价，ticker 流（交易所每秒推送）取 24h 最低价；新成交价严格低于 24h 最低价，说明刚刚创下 24 小时新低，ticker 下一秒即刷新到新低，条件随之解除。",
+"assumptions":["每次创新低的边沿触发一次，60 秒冷却内不重复提醒"],"unsupported":null}
 
 Reply with ONLY a JSON object, no markdown:
 { "spec": Spec, "explanation": string /* in the user's language: what raw data, which formula, when it fires */,

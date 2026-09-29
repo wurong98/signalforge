@@ -262,6 +262,10 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
   // ---------- Data Sources ----------
   app.get('/api/datasources', async () => {
     const h = hub.getStatus();
-    return { ...h, samples: Object.fromEntries(h.streams.map((s) => [s.symbol, hub.samples(s.symbol).slice(0, 5)])) };
+    // 每个交易对有 aggTrade / ticker 两条流，样例按 `SYMBOL@stream` 区分
+    return {
+      ...h,
+      samples: Object.fromEntries(h.streams.map((s) => [`${s.symbol}@${s.stream}`, hub.samples(s.symbol, s.stream).slice(0, 5)])),
+    };
   });
 }

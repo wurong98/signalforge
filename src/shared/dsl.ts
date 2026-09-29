@@ -53,9 +53,40 @@ export const CombineMetricSchema = z.object({
   b: name,
 });
 
-export const MetricSchema = z.discriminatedUnion('kind', [WindowMetricSchema, CombineMetricSchema]);
+/**
+ * Binance `<symbol>@ticker` 的 24h 滚动统计字段。
+ * 与 aggTrade 窗口指标的根本区别：统计由交易所侧维护并每秒推送，
+ * 收到的第一条就有效，不需要本地预热，也不受 60s 窗口上限约束。
+ */
+export const TICKER_FIELDS = [
+  /** c：最新成交价 */
+  'last_price',
+  /** h：24h 最高价 */
+  'high_24h',
+  /** l：24h 最低价 */
+  'low_24h',
+  /** p：24h 涨跌额 */
+  'change_24h',
+  /** P：24h 涨跌幅。DSL 统一用小数（0.05 = +5%），Binance 原值需除以 100 */
+  'change_pct_24h',
+  /** v：24h 成交量（base 币） */
+  'volume_24h',
+  /** q：24h 成交额（quote 币，如 USDT） */
+  'quote_volume_24h',
+] as const;
+export type TickerField = (typeof TICKER_FIELDS)[number];
+
+export const TickerMetricSchema = z.object({
+  name,
+  kind: z.literal('ticker'),
+  stream: z.literal('ticker'),
+  field: z.enum(TICKER_FIELDS),
+});
+
+export const MetricSchema = z.discriminatedUnion('kind', [WindowMetricSchema, CombineMetricSchema, TickerMetricSchema]);
 export type WindowMetric = z.infer<typeof WindowMetricSchema>;
 export type CombineMetric = z.infer<typeof CombineMetricSchema>;
+export type TickerMetric = z.infer<typeof TickerMetricSchema>;
 export type MetricDef = z.infer<typeof MetricSchema>;
 
 export const OperandSchema = z.union([
@@ -147,12 +178,26 @@ const FIELD_EXPR: Record<(typeof FIELDS)[number], string> = {
   notional: 'price × quantity',
 };
 
+const TICKER_EXPR: Record<TickerField, string> = {
+  last_price: 'TICKER.c',
+  high_24h: 'TICKER.h',
+  low_24h: 'TICKER.l',
+  change_24h: 'TICKER.p',
+  change_pct_24h: 'TICKER.P / 100',
+  volume_24h: 'TICKER.v',
+  quote_volume_24h: 'TICKER.q',
+};
+
 /** 指标 → 公式 → 原始数据 → Binance Stream 的可追溯描述 */
 export function describeFormula(m: MetricDef): string {
   if (m.kind === 'combine') {
     if (m.op === 'ratio') return `${m.a} / ${m.b}`;
     if (m.op === 'diff') return `${m.a} - ${m.b}`;
     return `(${m.a} - ${m.b}) / (${m.a} + ${m.b})`;
+  }
+  if (m.kind === 'ticker') {
+    // 交易所侧维护的 24h 滚动统计，收到即有效，没有预热概念
+    return `${TICKER_EXPR[m.field]}\nSTREAM @ticker · 24h 滚动统计（交易所侧维护，无预热）`;
   }
   const expr = FIELD_EXPR[m.field];
   const agg: Record<(typeof AGGREGATIONS)[number], string> = {
@@ -179,6 +224,11 @@ export function metricUnit(m: MetricDef, all: MetricDef[]): string {
     if (m.op === 'imbalance') return '';
     const a = all.find((x) => x.name === m.a);
     return a ? metricUnit(a, all) : '';
+  }
+  if (m.kind === 'ticker') {
+    if (m.field === 'change_pct_24h') return '%';
+    if (m.field === 'volume_24h') return 'base';
+    return 'USDT';
   }
   if (m.aggregation === 'count') return 'trades';
   if (m.aggregation === 'return') return '%';
