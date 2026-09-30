@@ -7,6 +7,8 @@ import { Db } from '../src/server/db.ts';
 import { extractJson, parseNaturalLanguage } from '../src/server/nl/parse.ts';
 import { parseWithRules } from '../src/server/nl/rules.ts';
 import { WebhookDispatcher, isPrivateAddress, sign } from '../src/server/webhook/delivery.ts';
+import { checkFeishuResponse, feishuSign, toFeishuMessage } from '../src/server/webhook/feishu.ts';
+import { isFeishuWebhook } from '../src/shared/webhook.ts';
 
 test('rules: core demo sentence', () => {
   const r = parseWithRules('BTC 最近 10 秒主动买入金额超过主动卖出金额 3 倍时调用我的 webhook。');
@@ -178,4 +180,72 @@ test('webhook: retries 5xx, stops on 4xx, signs body', async () => {
   assert.equal(blocked.ok, false);
   assert.match(blocked.error!, /private address/);
   server.close();
+});
+
+// ---------- 飞书机器人：专用格式 + 响应体判定（它出错也回 HTTP 200） ----------
+
+test('feishu: url detection', () => {
+  assert.ok(isFeishuWebhook('https://open.feishu.cn/open-apis/bot/v2/hook/abc'));
+  assert.ok(isFeishuWebhook('https://open.larksuite.com/open-apis/bot/v2/hook/abc'));
+  assert.ok(!isFeishuWebhook('https://open.feishu.cn/open-apis/im/v1/messages'));
+  assert.ok(!isFeishuWebhook('https://evil.com/open.feishu.cn/open-apis/bot/v2/hook/abc'));
+  assert.ok(!isFeishuWebhook('not a url'));
+});
+
+test('feishu: signature matches the official algorithm', () => {
+  // 参考值由飞书文档的 Python 示例独立计算：base64(hmac(key=f"{ts}\n{secret}", msg=b""))
+  assert.equal(feishuSign('demo', 1599360473), 'l1N0gAcBjdwBvGm1xMjOF0XSyaLRpR7tuO5dHfhAYc8=');
+  const m = toFeishuMessage({ event: 'signal.test', symbol: 'BTCUSDT' }, 'demo', 1599360473_500);
+  assert.equal(m.timestamp, '1599360473');
+  assert.equal(m.sign, 'l1N0gAcBjdwBvGm1xMjOF0XSyaLRpR7tuO5dHfhAYc8=');
+  assert.equal('sign' in toFeishuMessage({}, ''), false, '未配置 Secret 不带签名');
+});
+
+test('feishu: event becomes an interactive card', () => {
+  const m = toFeishuMessage(
+    { event: 'signal.triggered', event_id: 7, signal: 'btc-24h-new-low', title: 'BTC 24h New Low', symbol: 'BTCUSDT', exchange: 'binance', market: 'spot', timestamp: 0, condition: 'last_1s < low_24h × 1', metrics: { last_1s: 82562.5, low_24h: null } },
+    '',
+  ) as any;
+  assert.equal(m.msg_type, 'interactive');
+  assert.equal(m.card.header.title.content, 'SignalForge · BTC 24h New Low 触发');
+  const text = JSON.stringify(m.card.elements);
+  for (const s of ['BTCUSDT', 'binance spot', 'last_1s < low_24h', '82,562.5', 'low_24h = —', '1970/1/1 08:00:00 (UTC+8)', 'event #7']) assert.ok(text.includes(s), s);
+});
+
+test('feishu: response body decides success', () => {
+  assert.equal(checkFeishuResponse('{"code":0,"data":{},"msg":"success"}'), null);
+  assert.equal(checkFeishuResponse('{"Extra":null,"StatusCode":0,"StatusMessage":"success"}'), null);
+  assert.deepEqual(checkFeishuResponse('{"code":19021,"msg":"sign match fail"}'), { error: 'feishu code 19021: sign match fail', retriable: false });
+  assert.equal(checkFeishuResponse('{"code":11232,"msg":"frequency limited"}')!.retriable, true);
+  assert.equal(checkFeishuResponse('<html>')!.retriable, false);
+});
+
+test('feishu: HTTP 200 with error code is logged as a failed delivery', async () => {
+  const realFetch = globalThis.fetch;
+  const sent: any[] = [];
+  const replies = ['{"code":19002,"msg":"params error, msg_type need"}', '{"code":0,"msg":"success"}'];
+  globalThis.fetch = (async (_url: string, init: RequestInit) => {
+    sent.push({ headers: init.headers, body: JSON.parse(String(init.body)) });
+    return new Response(replies[sent.length - 1], { status: 200 });
+  }) as typeof fetch;
+  try {
+    const db = new Db(':memory:');
+    const id = db.insertWebhook({ name: 'ai-lab', url: 'https://open.feishu.cn/open-apis/bot/v2/hook/xxxxx', method: 'POST', headers: {}, secret: 'demo', timeout_ms: 2000, max_retries: 3 });
+    const d = new WebhookDispatcher(db, true, () => {}, [10, 10, 10]);
+    const w = db.getWebhook(id)!;
+
+    const bad = await d.deliver(w, { event: 'signal.test', symbol: 'BTCUSDT' }, null, true);
+    assert.equal(bad.ok, false, '200 + code≠0 不能记为成功');
+    assert.equal(bad.http_status, 200);
+    assert.match(bad.error!, /feishu code 19002/);
+    assert.equal(bad.attempts, 1, '业务错误不重试');
+
+    const good = await d.deliver(w, { event: 'signal.test', symbol: 'BTCUSDT' }, null, true);
+    assert.equal(good.ok, true);
+    assert.equal(sent[1].body.msg_type, 'interactive');
+    assert.ok(sent[1].body.sign, '请求体带飞书签名');
+    assert.equal((sent[1].headers as Record<string, string>)['x-signalforge-signature'], undefined);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });

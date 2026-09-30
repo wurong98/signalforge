@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { DeliveryLine } from '../components/bits.tsx';
 import type { Delivery } from '../lib.ts';
 import { ApiError, api, fmtAgo, useLive, useNow } from '../lib.ts';
+import { isFeishuWebhook } from '../../../src/shared/webhook.ts';
 
 interface Hook {
   id: number;
@@ -88,6 +89,12 @@ export function WebhooksPage() {
           <h2>{form.id ? 'Edit Webhook' : 'New Webhook'}</h2>
           {errors.length > 0 && <div className="alert bad">{errors.map((e, i) => <div key={i}>{e}</div>)}</div>}
           <label>URL<input value={form.url} onChange={(e) => setForm({ ...form, url: e.target.value })} placeholder="https://example.com/webhook" /></label>
+          {isFeishuWebhook(form.url) && (
+            <div className="muted small">
+              已识别为飞书机器人：以消息卡片发送，并按响应体 code 判定成败。机器人开启"签名校验"时把密钥填入 Secret；
+              开启"自定义关键词"时，关键词需包含在卡片标题中（如 SignalForge）。
+            </div>
+          )}
           <label>Name<input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="默认使用域名" /></label>
           <div className="row">
             <label>Method
@@ -99,7 +106,7 @@ export function WebhooksPage() {
             <label>Timeout (ms)<input type="number" value={form.timeout_ms} onChange={(e) => setForm({ ...form, timeout_ms: Number(e.target.value) })} /></label>
             <label>Max retries<input type="number" min={0} max={3} value={form.max_retries} onChange={(e) => setForm({ ...form, max_retries: Number(e.target.value) })} /></label>
           </div>
-          <label>Secret<input value={form.secret} onChange={(e) => setForm({ ...form, secret: e.target.value })} placeholder="可选" /></label>
+          <label>Secret<input value={form.secret} onChange={(e) => setForm({ ...form, secret: e.target.value })} placeholder={isFeishuWebhook(form.url) ? '飞书签名校验密钥（可选）' : '可选'} /></label>
           <label>Headers (JSON)<textarea rows={3} className="json" value={form.headers} onChange={(e) => setForm({ ...form, headers: e.target.value })} /></label>
           <div className="row">
             <button className="primary" onClick={save}>Save</button>
