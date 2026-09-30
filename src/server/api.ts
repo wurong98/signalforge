@@ -226,17 +226,19 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
   app.post('/api/webhooks/:id/test', async (req, reply) => {
     const w = db.getWebhook(idParam(req));
     if (!w) return bad(reply, 'not found', 404);
+    // 飞书测试卡片用真实行情快照；通用 Webhook 的测试报文不变
+    const live = runtime.latestTicker();
     const payload = {
       event: 'signal.test',
       signal: 'test',
       exchange: 'binance',
       market: 'spot',
-      symbol: 'BTCUSDT',
+      symbol: live?.symbol ?? 'BTCUSDT',
       timestamp: Date.now(),
       metrics: { buy_notional_10s: 9213481.21, sell_notional_10s: 2821731.82, ratio: 3.26 },
     };
     // 测试只尝试一次，立即返回结果
-    return dispatcher.deliver({ ...w, max_retries: 0 }, payload, null, true);
+    return dispatcher.deliver({ ...w, max_retries: 0 }, payload, null, true, { ticker: live?.ticker });
   });
 
   app.get('/api/webhooks/:id/deliveries', async (req) => db.listDeliveries({ webhookId: idParam(req), limit: 100 }));

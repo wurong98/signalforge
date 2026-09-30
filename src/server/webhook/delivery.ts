@@ -11,7 +11,7 @@ import { isIP } from 'node:net';
 import { RETRY_DELAYS_MS } from '../../shared/dsl.ts';
 import { isFeishuWebhook } from '../../shared/webhook.ts';
 import type { Db, WebhookRow } from '../db.ts';
-import type { FeishuSource } from './feishu.ts';
+import type { FeishuContext, FeishuSource } from './feishu.ts';
 import { checkFeishuResponse, toFeishuMessage } from './feishu.ts';
 
 export interface AttemptResult {
@@ -115,9 +115,16 @@ export class WebhookDispatcher {
   ) {}
 
   /** 投递并按策略重试，每次尝试都写入日志；返回最终是否成功 */
-  async deliver(w: WebhookRow, payload: unknown, eventId: number | null, isTest = false): Promise<AttemptResult & { attempts: number }> {
+  /** feishu：通用 payload 之外、仅供飞书卡片使用的上下文（spec / 触发值 / ticker），不影响其他 Webhook 的报文 */
+  async deliver(
+    w: WebhookRow,
+    payload: unknown,
+    eventId: number | null,
+    isTest = false,
+    feishu: FeishuContext = {},
+  ): Promise<AttemptResult & { attempts: number }> {
     // 飞书签名的时间戳须在 1 小时内，整轮重试最长约 36s，生成一次即可
-    const body = JSON.stringify(isFeishuWebhook(w.url) ? toFeishuMessage(payload as FeishuSource, w.secret) : payload);
+    const body = JSON.stringify(isFeishuWebhook(w.url) ? toFeishuMessage(payload as FeishuSource, feishu, w.secret) : payload);
     const maxAttempts = 1 + Math.min(w.max_retries, this.delays.length);
     let last!: AttemptResult;
     for (let n = 1; n <= maxAttempts; n++) {

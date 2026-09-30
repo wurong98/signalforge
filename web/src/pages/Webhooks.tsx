@@ -92,7 +92,7 @@ export function WebhooksPage() {
           {isFeishuWebhook(form.url) && (
             <div className="muted small">
               已识别为飞书机器人：以消息卡片发送，并按响应体 code 判定成败。机器人开启"签名校验"时把密钥填入 Secret；
-              开启"自定义关键词"时，关键词需包含在卡片标题中（如 SignalForge）。
+              开启"自定义关键词"时，把关键词设为 SignalForge（每张卡片脚注都带）。
             </div>
           )}
           <label>Name<input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="默认使用域名" /></label>
