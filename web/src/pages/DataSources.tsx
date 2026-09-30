@@ -2,9 +2,17 @@ import { useEffect, useState } from 'react';
 import type { StreamStats } from '../lib.ts';
 import { api, fmtAgo, useLive, useNow } from '../lib.ts';
 
-const FIELD_NAMES: Record<string, string> = {
+/** 两条流的字段表不同：aggTrade 是逐笔成交，ticker 是 24h 滚动统计 */
+const AGGTRADE_FIELDS: Record<string, string> = {
   e: 'Event type', E: 'Event time', s: 'Symbol', a: 'Aggregate trade ID', p: 'Price', q: 'Quantity',
   f: 'First trade ID', l: 'Last trade ID', T: 'Trade time', m: 'Buyer is maker', M: 'Ignore',
+};
+
+const TICKER_FIELDS: Record<string, string> = {
+  e: 'Event type', E: 'Event time', s: 'Symbol', p: 'Price change', P: 'Price change percent', w: 'Weighted avg price',
+  x: 'Previous close', c: 'Current close', Q: 'Close quote volume', b: 'Best bid', B: 'Best bid qty',
+  a: 'Best ask', A: 'Best ask qty', o: 'Open', h: '24h high', l: '24h low', v: 'Base volume', q: 'Quote volume',
+  O: 'Stats open time', C: 'Stats close time', F: 'First trade ID', L: 'Last trade ID', n: 'Number of trades',
 };
 
 export function DataSourcesPage() {
@@ -42,8 +50,11 @@ export function DataSourcesPage() {
           <span className="small">{b?.last_error ?? '—'}</span>
         </div>
       </div>
-      {b?.streams.map((s: StreamStats) => (
-        <div key={s.symbol} className="card">
+      {b?.streams.map((s: StreamStats) => {
+        const fields = s.stream === 'ticker' ? TICKER_FIELDS : AGGTRADE_FIELDS;
+        const sample = samples[`${s.symbol}@${s.stream}`]?.[0];
+        return (
+        <div key={`${s.symbol}@${s.stream}`} className="card">
           <div className="page-head">
             <h2>
               {s.symbol} <span className="muted">@</span> {s.stream}
@@ -59,13 +70,14 @@ export function DataSourcesPage() {
           </div>
           <h4>Sample Raw Event</h4>
           <div className="raw">
-            <pre className="formula">{samples[s.symbol]?.[0] ? JSON.stringify(samples[s.symbol][0], null, 2) : '—'}</pre>
+            <pre className="formula">{sample ? JSON.stringify(sample, null, 2) : '—'}</pre>
             <div className="kv small">
-              {Object.entries(FIELD_NAMES).flatMap(([k, v]) => [<code key={k}>{k}</code>, <span key={`${k}v`}>{v}</span>])}
+              {Object.entries(fields).flatMap(([k, v]) => [<code key={k}>{k}</code>, <span key={`${k}v`}>{v}</span>])}
             </div>
           </div>
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

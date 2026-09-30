@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { test } from 'node:test';
+import { validateSpec } from '../src/shared/dsl.ts';
 import { Db } from '../src/server/db.ts';
 import { extractJson, parseNaturalLanguage } from '../src/server/nl/parse.ts';
 import { parseWithRules } from '../src/server/nl/rules.ts';
@@ -42,6 +43,97 @@ test('parse: falls back to rules without LLM', async () => {
   const r = await parseNaturalLanguage('BTC 10 秒主动买盘超过卖盘 3 倍时通知我', null);
   assert.ok(!('error' in r));
   assert.equal(r.parser, 'rules');
+});
+
+// ---------- 24h 档：走 @ticker，不退化成长度 ≤60s 的窗口 ----------
+
+test('rules: 24h new low uses ticker, not a degraded 60s window', () => {
+  const r = parseWithRules('BTC 创 24 小时新低时提醒我，每分钟最多一次');
+  assert.ok(!('error' in r));
+  assert.equal(r.spec.name, 'btc-24h-new-low');
+  assert.equal(r.spec.market.symbol, 'BTCUSDT');
+  assert.equal(r.spec.cooldown_ms, 60_000);
+  assert.deepEqual(r.spec.metrics, [
+    { name: 'last_1s', kind: 'window', stream: 'aggTrade', window: '1s', filter: {}, field: 'price', aggregation: 'last' },
+    { name: 'low_24h', kind: 'ticker', stream: 'ticker', field: 'low_24h' },
+  ]);
+  // 严格小于：新成交价跌破 ticker 尚未更新的 24h 低点
+  assert.deepEqual(r.spec.condition, { left: 'last_1s', operator: '<', right: { metric: 'low_24h', multiplier: 1 } });
+  // 24h 档与窗口无关，不该被塞进"未指定时间窗口"的假设
+  assert.ok(!r.assumptions.some((a) => a.includes('时间窗口')), r.assumptions.join(' | '));
+  assert.equal(validateSpec(r.spec).ok, true);
+});
+
+test('rules: 24h new high is the mirror image', () => {
+  const r = parseWithRules('ETH 一天内创新高时通知我，每 30 秒一次');
+  assert.ok(!('error' in r));
+  assert.equal(r.spec.name, 'eth-24h-new-high');
+  assert.equal(r.spec.cooldown_ms, 30_000);
+  assert.deepEqual(r.spec.metrics[1], { name: 'high_24h', kind: 'ticker', stream: 'ticker', field: 'high_24h' });
+  assert.deepEqual(r.spec.condition, { left: 'last_1s', operator: '>', right: { metric: 'high_24h', multiplier: 1 } });
+});
+
+test('rules: 24h change percent, direction and two-sided', () => {
+  const up = parseWithRules('BTC 24小时涨幅超过 5% 时提醒我');
+  assert.ok(!('error' in up));
+  assert.deepEqual(up.spec.metrics, [{ name: 'change_pct_24h', kind: 'ticker', stream: 'ticker', field: 'change_pct_24h' }]);
+  assert.deepEqual(up.spec.condition, { left: 'change_pct_24h', operator: '>=', right: { value: 0.05 } });
+
+  const down = parseWithRules('SOL 24小时跌幅超过 3% 时提醒我');
+  assert.ok(!('error' in down));
+  assert.deepEqual(down.spec.condition, { left: 'change_pct_24h', operator: '<=', right: { value: -0.03 } });
+
+  // "涨跌幅" 不分方向 → 双向 OR
+  const both = parseWithRules('BTC 24小时涨跌幅超过 2%');
+  assert.ok(!('error' in both));
+  assert.deepEqual(both.spec.condition, {
+    op: 'or',
+    conditions: [
+      { left: 'change_pct_24h', operator: '>=', right: { value: 0.02 } },
+      { left: 'change_pct_24h', operator: '<=', right: { value: -0.02 } },
+    ],
+  });
+  for (const r of [up, down, both]) assert.equal(validateSpec(r.spec).ok, true);
+});
+
+test('rules: fractional percent yields a valid slug', () => {
+  const r = parseWithRules('BTC 24小时涨幅超过2.5%');
+  assert.ok(!('error' in r));
+  assert.equal(r.spec.name, 'btc-24h-pump-2p5pct');
+  assert.equal(validateSpec(r.spec).ok, true);
+});
+
+test('rules: cooldown needs a rate-limit phrase, supports hours', () => {
+  const cd = (t: string) => {
+    const r = parseWithRules(t);
+    assert.ok(!('error' in r));
+    return r.spec.cooldown_ms;
+  };
+  assert.equal(cd('BTC 创 24 小时新低时提醒我，每分钟最多一次'), 60_000);
+  assert.equal(cd('BTC 创 24 小时新低，每 30 秒提醒一次'), 30_000);
+  assert.equal(cd('BTC 24小时新低，每小时最多一次'), 3600_000);
+  assert.equal(cd('BTC 24小时新低，冷却 2 小时'), 7200_000);
+  // "每 30 秒" 描述的是统计口径，不是冷却 → 默认 10s
+  assert.equal(cd('BTC 每 30 秒主动买入金额超过主动卖出金额 3 倍'), 10_000);
+});
+
+test('rules: english direction words need word boundaries', () => {
+  const r = parseWithRules('BTC 24h change 5% after supply update');
+  assert.ok(!('error' in r));
+  assert.equal(r.spec.condition && 'op' in r.spec.condition ? r.spec.condition.op : null, 'or');
+  const up = parseWithRules('BTC 24h up 5%');
+  assert.ok(!('error' in up));
+  assert.deepEqual(up.spec.condition, { left: 'change_pct_24h', operator: '>=', right: { value: 0.05 } });
+});
+
+test('rules: short-window sentences are unaffected by the 24h branch', () => {
+  // "10 秒" 不含 24h，仍应走窗口分支
+  const n = parseWithRules('BTC 7 秒涨 1%');
+  assert.ok(!('error' in n));
+  assert.equal(n.spec.metrics[0].kind === 'window' && n.spec.metrics[0].window, '5s');
+  const b = parseWithRules('BTC 10 秒主动买入超过卖出 3 倍');
+  assert.ok(!('error' in b));
+  assert.equal(b.spec.metrics[0].kind, 'window');
 });
 
 test('extractJson strips think blocks and fences', () => {

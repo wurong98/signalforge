@@ -35,23 +35,28 @@ Binance Signal Studio：自然语言 → Signal DSL → 确定性 Runtime（Bina
 6. **事件自包含**。`events` 表保存触发时的 `spec` 快照与每个叶子条件的左右值；Explain 只读快照，不读当前 Signal 定义。
 7. **Webhook 安全**：默认拒绝私有地址、不跟随重定向。不要为了方便测试去掉这些检查——用 `ALLOW_PRIVATE_WEBHOOKS=true`。
 8. 事件与投递日志**永久保留**，删除 Signal 不删它们。
+9. **长周期需求走 `kind:"ticker"`，不得退化成窗口近似**。aggTrade 窗口上限 60s，"24 小时新低"这类语义只能由 `<symbol>@ticker`（交易所侧维护的 24h 滚动统计，每秒下发、无预热）表达。两个配套约束：
+   - ticker **不参与**成交窗口的时钟与预热（`nowEx` / `continuousSince` 仍只由 aggTrade 驱动），只更新快照；
+   - 用到 ticker 的 Signal 必须等到**第一条 ticker 到达**才算就绪（`requiresTicker()`）。否则就绪瞬间 ticker 还是 null（条件假 → ARMED），下一秒 ticker 到达、条件转真，会被误判成边沿而触发，直接破坏不变量 5；
+   - 断线时 ticker 快照随窗口一起作废（`markDisconnected()` 清空），重连后同样要等第一条新 ticker。旧快照不含断线期间的行情，拿它判就绪会把"断线期间已满足"的条件当成边沿触发，旧极值还会导致误报新低/新高；
+   - 创新低/新高用**严格**不等号（`last_1s < low_24h`）。成交价"等于"极值只是恰好停在那儿；用 `<=` 会让条件在整段下跌中持续为真，整个过程只在第一次反弹时触发一次，限频就完全失效了。代价是：若某次 ticker 比 aggTrade 先到、已经包含了这笔新极值，这次会漏报（只会漏、不会误报，下一次创新低照常触发）。
 
 ## 代码地图
 
 ```
 src/shared/dsl.ts            DSL schema(zod) + 校验 + 人类可读描述
-src/shared/catalog.ts        内置指标（Explore / 提示词）
+src/shared/catalog.ts        内置指标（Explore / 提示词），含 24h ticker 指标
 src/server/index.ts          入口：组装 Db / BinanceHub / Dispatcher / Runtime / Fastify
 src/server/config.ts         环境变量
 src/server/api.ts            REST + SSE（/api/live 每秒推送状态）
 src/server/db.ts             node:sqlite，表：webhooks signals events deliveries metric_points
-src/server/binance/stream.ts WS 连接、重连、假死检测、原始事件环形缓存
-src/server/engine/window.ts  增量滑动窗口累加器
+src/server/binance/stream.ts WS 连接（每对同时订阅 aggTrade + ticker）、重连、假死检测、环形缓存
+src/server/engine/window.ts  增量滑动窗口累加器 + 24h ticker 快照
 src/server/engine/signal.ts  条件求值 + 状态机
 src/server/engine/runtime.ts 编排、采样、事件、派发
 src/server/webhook/delivery.ts  签名 / 重试 / SSRF
 src/server/nl/parse.ts       LLM 解析 + 校验修复循环
-src/server/nl/rules.ts       规则解析兜底 + 噪声下限
+src/server/nl/rules.ts       规则解析兜底 + 噪声下限 + 24h 档
 web/src/                     React 前端（lib.ts 为 API/类型/格式化）
 test/                        单元测试
 docs/                        PRD 评审、交接文档

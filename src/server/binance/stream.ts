@@ -2,12 +2,20 @@
  * Binance Spot 公共行情 WebSocket（PRD §4 §18 §20 §25）。
  * 使用 combined stream，动态 SUBSCRIBE/UNSUBSCRIBE；断线指数退避重连；
  * 30s 无消息视为假死并主动重连；原始事件保留在内存环形缓存供 Data Sources 页查看。
+ *
+ * 每个交易对同时订阅两条流：
+ * - `<symbol>@aggTrade` 逐笔聚合成交，驱动本地滑动窗口指标（最长 60s）；
+ * - `<symbol>@ticker` 交易所侧维护的 24h 滚动统计，用来表达 aggTrade 窗口无法覆盖的
+ *   长时间跨度需求（24h 新低、24h 涨跌幅），无需本地预热。
  */
 import { EventEmitter } from 'node:events';
-import type { Trade } from '../engine/window.ts';
+import type { Ticker, Trade } from '../engine/window.ts';
+
+export const STREAMS = ['aggTrade', 'ticker'] as const;
+export type StreamName = (typeof STREAMS)[number];
 
 export interface StreamStats {
-  stream: string;
+  stream: StreamName;
   symbol: string;
   status: 'connecting' | 'connected' | 'disconnected' | 'error';
   messages_total: number;
@@ -39,8 +47,24 @@ interface StreamState {
 
 export declare interface BinanceHub {
   on(ev: 'trade', fn: (symbol: string, t: Trade, eventTime: number, recvLocal: number) => void): this;
+  on(ev: 'ticker', fn: (symbol: string, t: Ticker, eventTime: number, recvLocal: number) => void): this;
   on(ev: 'connected', fn: (symbols: string[], at: number) => void): this;
   on(ev: 'disconnected', fn: (reason: string) => void): this;
+}
+
+/** 24h ticker 报文 → 归一化快照；P 由百分数转为小数，与 DSL 百分比约定一致 */
+function parseTicker(d: any): Ticker | null {
+  if (d?.e !== '24hrTicker') return null;
+  const last = Number(d.c);
+  const high = Number(d.h);
+  const low = Number(d.l);
+  const change = Number(d.p);
+  const pct = Number(d.P);
+  const volume = Number(d.v);
+  const quoteVolume = Number(d.q);
+  if (![last, high, low, change, pct, volume, quoteVolume].every(Number.isFinite)) return null;
+  if (!Number.isFinite(d.E)) return null;
+  return { E: d.E, last, high, low, change, changePct: pct / 100, volume, quoteVolume };
 }
 
 export class BinanceHub extends EventEmitter {
@@ -62,8 +86,12 @@ export class BinanceHub extends EventEmitter {
     super();
   }
 
-  private key(symbol: string) {
-    return `${symbol.toLowerCase()}@aggTrade`;
+  private key(symbol: string, stream: StreamName) {
+    return `${symbol.toLowerCase()}@${stream}`;
+  }
+
+  private keysOf(symbol: string) {
+    return STREAMS.map((s) => this.key(symbol, s));
   }
 
   start(symbols: string[]) {
@@ -81,16 +109,18 @@ export class BinanceHub extends EventEmitter {
   }
 
   private addState(symbol: string) {
-    const k = this.key(symbol);
-    if (this.streams.has(k)) return;
-    this.streams.set(k, {
-      stats: {
-        stream: 'aggTrade', symbol, status: 'connecting', messages_total: 0, malformed_total: 0,
-        messages_per_min: 0, last_message_local: null, latency_ms: null, last_error: null,
-      },
-      recent: [],
-      raw: [],
-    });
+    for (const stream of STREAMS) {
+      const k = this.key(symbol, stream);
+      if (this.streams.has(k)) continue;
+      this.streams.set(k, {
+        stats: {
+          stream, symbol, status: 'connecting', messages_total: 0, malformed_total: 0,
+          messages_per_min: 0, last_message_local: null, latency_ms: null, last_error: null,
+        },
+        recent: [],
+        raw: [],
+      });
+    }
   }
 
   /** 确保某交易对已订阅（Signal 引用新交易对时调用） */
@@ -99,21 +129,21 @@ export class BinanceHub extends EventEmitter {
     this.symbols.add(symbol);
     this.addState(symbol);
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ method: 'SUBSCRIBE', params: [this.key(symbol)], id: this.reqId++ }));
+      this.ws.send(JSON.stringify({ method: 'SUBSCRIBE', params: this.keysOf(symbol), id: this.reqId++ }));
     }
   }
 
   release(symbol: string) {
     if (!this.symbols.delete(symbol)) return;
-    this.streams.delete(this.key(symbol));
+    for (const k of this.keysOf(symbol)) this.streams.delete(k);
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ method: 'UNSUBSCRIBE', params: [this.key(symbol)], id: this.reqId++ }));
+      this.ws.send(JSON.stringify({ method: 'UNSUBSCRIBE', params: this.keysOf(symbol), id: this.reqId++ }));
     }
   }
 
   private connect() {
     if (this.stopped) return;
-    const streams = [...this.symbols].map((s) => this.key(s));
+    const streams = [...this.symbols].flatMap((s) => this.keysOf(s));
     const url = `${this.baseUrl}/stream?streams=${streams.join('/')}`;
     this.status = 'connecting';
     for (const s of this.streams.values()) s.stats.status = 'connecting';
@@ -172,6 +202,11 @@ export class BinanceHub extends EventEmitter {
     }
   }
 
+  private malformed(st: StreamState, reason: string, text: string) {
+    st.stats.malformed_total++;
+    st.stats.last_error = `${reason}: ${text.slice(0, 200)}`;
+  }
+
   private onMessage(text: string) {
     const recv = Date.now();
     this.lastMessageLocal = recv;
@@ -193,20 +228,34 @@ export class BinanceHub extends EventEmitter {
     const st = this.streams.get(msg.stream);
     if (!st) return;
     const d = msg.data;
-    const p = Number(d?.p);
-    const q = Number(d?.q);
-    if (d?.e !== 'aggTrade' || !Number.isFinite(p) || !Number.isFinite(q) || typeof d.m !== 'boolean' || !Number.isFinite(d.T)) {
-      st.stats.malformed_total++;
-      st.stats.last_error = `malformed event: ${text.slice(0, 200)}`;
-      return;
+
+    // 先校验再计数：畸形报文不计入 messages_total，也不进原始事件环形缓存
+    let payload: Trade | Ticker;
+    if (st.stats.stream === 'ticker') {
+      const t = parseTicker(d);
+      if (!t) return this.malformed(st, 'malformed ticker event', text);
+      payload = t;
+    } else {
+      const p = Number(d?.p);
+      const q = Number(d?.q);
+      if (d?.e !== 'aggTrade' || !Number.isFinite(p) || !Number.isFinite(q) || typeof d.m !== 'boolean' || !Number.isFinite(d.T)) {
+        return this.malformed(st, 'malformed event', text);
+      }
+      payload = { a: d.a, T: d.T, p, q, m: d.m };
     }
+
     st.stats.messages_total++;
     st.stats.last_message_local = recv;
     st.stats.latency_ms = recv - d.E;
     st.recent.push(recv);
     st.raw.push(d);
     if (st.raw.length > RAW_RING) st.raw.shift();
-    this.emit('trade', d.s as string, { a: d.a, T: d.T, p, q, m: d.m }, d.E as number, recv);
+
+    if (st.stats.stream === 'ticker') {
+      this.emit('ticker', d.s as string, payload as Ticker, d.E as number, recv);
+    } else {
+      this.emit('trade', d.s as string, payload as Trade, d.E as number, recv);
+    }
   }
 
   getStatus(): HubStatus {
@@ -225,7 +274,8 @@ export class BinanceHub extends EventEmitter {
     };
   }
 
-  samples(symbol: string): unknown[] {
-    return [...(this.streams.get(this.key(symbol))?.raw ?? [])].reverse();
+  /** Data Sources 页用：`${symbol}@${stream}` → 最近的原始报文（最新在前） */
+  samples(symbol: string, stream: StreamName = 'aggTrade'): unknown[] {
+    return [...(this.streams.get(this.key(symbol, stream))?.raw ?? [])].reverse();
   }
 }

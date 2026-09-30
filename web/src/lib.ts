@@ -40,7 +40,7 @@ export interface RunnerStatus {
   error: string | null;
 }
 export interface StreamStats {
-  stream: string;
+  stream: 'aggTrade' | 'ticker';
   symbol: string;
   status: string;
   messages_total: number;
@@ -53,7 +53,14 @@ export interface StreamStats {
 export interface LiveTick {
   server_time: number;
   binance: { status: string; url: string; connected_since: number | null; reconnects: number; last_error: string | null; streams: StreamStats[] };
-  symbols: { symbol: string; ready_60s: boolean; buffer: number; exchange_now: number; last_trade: { p: number; T: number } | null }[];
+  symbols: {
+    symbol: string;
+    ready_60s: boolean;
+    buffer: number;
+    exchange_now: number;
+    last_trade: { p: number; T: number } | null;
+    ticker_24h: { last: number; high: number; low: number; change_pct: number; E: number } | null;
+  }[];
   llm: { enabled: boolean; model?: string };
   signals: RunnerStatus[];
 }
