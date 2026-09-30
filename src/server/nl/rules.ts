@@ -40,15 +40,21 @@ export function detectWindow(text: string): { window: WindowSpec; assumed: boole
   return { window: `${nearest}s` as WindowSpec, assumed: true, note: `窗口 ${sec}s 不在支持列表，已取最接近的 ${nearest}s` };
 }
 
+/** DSL 上限：cooldown_ms ≤ 24h */
+const MAX_COOLDOWN_MS = 24 * 3600_000;
+
 function detectCooldown(text: string): number | null {
   const m =
-    text.match(/冷却\s*(\d+)\s*(秒|s|分钟|min)/i) ??
-    text.match(/cooldown\s*(\d+)\s*(s|min)/i) ??
-    // "每分钟提醒一次" / "每 30 秒最多一次"：省略数字时按 1 计
-    text.match(/每\s*(\d+)?\s*(秒|s\b|分钟|min)/i);
+    text.match(/冷却\s*(\d+)\s*(秒|分钟|min|小时|hours?|s|h)/i) ??
+    text.match(/cooldown\s*(\d+)\s*(min|hours?|s|h)/i) ??
+    // "每分钟最多一次" / "每 30 秒提醒一次" / "每小时最多一次"：省略数字时按 1 计。
+    // 必须在同一分句内跟着"一次/最多"等限频词：否则"每 30 秒成交额超过…"这种描述统计口径的说法
+    // 会被误读成冷却时间。
+    text.match(/每\s*(\d+)?\s*(秒|分钟|min|小时|hours?|s\b|h\b)[^，,。;；]*?(一次|最多|至多|不超过)/i);
   if (!m) return null;
   const n = m[1] === undefined ? 1 : Number(m[1]);
-  return n * (/分|min/i.test(m[2]) ? 60_000 : 1_000);
+  const unit = /分|min/i.test(m[2]) ? 60_000 : /小时|hour|^h$/i.test(m[2]) ? 3600_000 : 1_000;
+  return Math.min(n * unit, MAX_COOLDOWN_MS);
 }
 
 /**
@@ -115,8 +121,9 @@ function parse24h(
   if (pct && !hasShortWindow) {
     const num = Number(pct[2] ?? pct[1]);
     // "涨跌幅" 同时含涨跌两个字；只说"涨跌幅"应理解为双向波动
-    const up = /涨幅|上涨|涨了|涨超|rise|up/i.test(text) && !/跌|drop|down/i.test(text);
-    const down = /跌幅|下跌|跌了|跌超|drop|down/i.test(text) && !/涨|rise|up/i.test(text);
+    // 英文词加单词边界：否则 "supply" / "update" 里的 up 会被当成方向
+    const up = /涨幅|上涨|涨了|涨超|\brises?\b|\bup\b/i.test(text) && !/跌|\bdrops?\b|\bdown\b/i.test(text);
+    const down = /跌幅|下跌|跌了|跌超|\bdrops?\b|\bdown\b/i.test(text) && !/涨|\brises?\b|\bup\b/i.test(text);
     const metric: MetricDef = { name: 'change_pct_24h', kind: 'ticker', stream: 'ticker', field: 'change_pct_24h' };
     const both: SignalSpec['condition'] = {
       op: 'or',
@@ -129,7 +136,8 @@ function parse24h(
       parser: 'rules',
       assumptions,
       spec: {
-        name: `${base}-24h-${up ? 'pump' : down ? 'drop' : 'swing'}-${num}pct`,
+        // slug 只允许 [a-z0-9-]：小数点换成 p（2.5% → 2p5pct），否则 validateSpec 直接拒绝
+        name: `${base}-24h-${up ? 'pump' : down ? 'drop' : 'swing'}-${String(num).replace('.', 'p')}pct`,
         title: `${base.toUpperCase()} 24h ${up ? 'Rise' : down ? 'Drop' : 'Swing'} ${num}%`,
         description: text,
         market,

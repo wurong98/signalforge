@@ -90,6 +90,10 @@ export class SymbolWindows {
   }
   markDisconnected() {
     this.continuousSince = null;
+    // 断线期间的 24h 统计已无从得知，旧快照必须作废：否则重连后 requiresTicker() 立刻放行，
+    // 用旧值判出"假 → ARMED"，下一条新 ticker 把"断线期间就已满足"的条件当成边沿触发（不变量 5）；
+    // 对新低/新高更糟——旧极值没包含断线期间的新极值，重连后一笔并非新低的成交也会误报。
+    this.tickerSnap = null;
   }
 
   pushTicker(t: Ticker) {

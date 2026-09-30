@@ -96,6 +96,36 @@ test('rules: 24h change percent, direction and two-sided', () => {
   for (const r of [up, down, both]) assert.equal(validateSpec(r.spec).ok, true);
 });
 
+test('rules: fractional percent yields a valid slug', () => {
+  const r = parseWithRules('BTC 24小时涨幅超过2.5%');
+  assert.ok(!('error' in r));
+  assert.equal(r.spec.name, 'btc-24h-pump-2p5pct');
+  assert.equal(validateSpec(r.spec).ok, true);
+});
+
+test('rules: cooldown needs a rate-limit phrase, supports hours', () => {
+  const cd = (t: string) => {
+    const r = parseWithRules(t);
+    assert.ok(!('error' in r));
+    return r.spec.cooldown_ms;
+  };
+  assert.equal(cd('BTC 创 24 小时新低时提醒我，每分钟最多一次'), 60_000);
+  assert.equal(cd('BTC 创 24 小时新低，每 30 秒提醒一次'), 30_000);
+  assert.equal(cd('BTC 24小时新低，每小时最多一次'), 3600_000);
+  assert.equal(cd('BTC 24小时新低，冷却 2 小时'), 7200_000);
+  // "每 30 秒" 描述的是统计口径，不是冷却 → 默认 10s
+  assert.equal(cd('BTC 每 30 秒主动买入金额超过主动卖出金额 3 倍'), 10_000);
+});
+
+test('rules: english direction words need word boundaries', () => {
+  const r = parseWithRules('BTC 24h change 5% after supply update');
+  assert.ok(!('error' in r));
+  assert.equal(r.spec.condition && 'op' in r.spec.condition ? r.spec.condition.op : null, 'or');
+  const up = parseWithRules('BTC 24h up 5%');
+  assert.ok(!('error' in up));
+  assert.deepEqual(up.spec.condition, { left: 'change_pct_24h', operator: '>=', right: { value: 0.05 } });
+});
+
 test('rules: short-window sentences are unaffected by the 24h branch', () => {
   // "10 秒" 不含 24h，仍应走窗口分支
   const n = parseWithRules('BTC 7 秒涨 1%');

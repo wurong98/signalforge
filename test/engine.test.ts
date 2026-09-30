@@ -272,3 +272,58 @@ test('ticker-only signal: waits for the first ticker, so an already-true 24h cha
   d.step(62_100);
   assert.deepEqual(d.fires, [62_100]);
 });
+
+test('ticker: reconnect discards the stale snapshot, so a change made during the outage does not fire', () => {
+  const w = new SymbolWindows();
+  w.markContinuous(0);
+  const spec: SignalSpec = {
+    name: 'btc-24h-pump-5pct', title: 'BTC 24h Rise 5%', description: '', cooldown_ms: 60_000,
+    market: { exchange: 'binance', product: 'spot', symbol: 'BTCUSDT' },
+    metrics: [pct24],
+    condition: { left: 'change_pct_24h', operator: '>=', right: { value: 0.05 } },
+  };
+  const d = drive(w, spec);
+  w.push(trade(1_000, 100, 1, false));
+  w.pushTicker(ticker({ changePct: 0.049 }));
+  d.step(1_000);
+  assert.equal(d.state(), 'ARMED');
+
+  w.markDisconnected(); // 断线期间涨幅越过 5%
+  assert.equal(w.ticker24h, null, '旧快照必须作废');
+  d.step(2_000);
+  assert.equal(d.state(), 'WARMING');
+
+  w.markContinuous(30_000); // 重连：aggTrade 先到，ticker 还没来
+  w.push(trade(30_000, 105, 1, false));
+  d.step(30_000);
+  assert.equal(d.state(), 'WARMING', '不能拿断线前的旧 ticker 判就绪');
+
+  w.pushTicker(ticker({ changePct: 0.052 })); // 重连后第一条 ticker：条件已满足
+  d.step(30_100);
+  assert.equal(d.state(), 'ACTIVE');
+  assert.deepEqual(d.fires, [], '断线期间就已满足的条件不触发');
+});
+
+test('24h new low: reconnect with a stale low does not report a fake new low', () => {
+  const w = new SymbolWindows();
+  w.markContinuous(0);
+  const d = drive(w, newLowSpec());
+  w.push(trade(1_000, 103, 1, false));
+  w.pushTicker(ticker({ low: 102 }));
+  d.step(1_000);
+  assert.equal(d.state(), 'ARMED');
+
+  // 断线期间跌到 100 又反弹；旧快照的 low 仍是 102
+  w.markDisconnected();
+  w.markContinuous(60_000);
+  w.push(trade(60_000, 103, 1, false));
+  d.step(61_000); // 1s 窗口已预热，但重连后的新 ticker 尚未到达
+  w.push(trade(61_050, 101, 1, false)); // 101 < 旧 low 102，但并不是新低（真实 24h 低点是 100）
+  d.step(61_050);
+  assert.deepEqual(d.fires, [], '旧快照不能用来判新低');
+
+  w.pushTicker(ticker({ low: 100 }));
+  d.step(61_100);
+  assert.equal(d.state(), 'ARMED'); // 101 > 100：新 ticker 到达后正常武装
+  assert.deepEqual(d.fires, []);
+});
