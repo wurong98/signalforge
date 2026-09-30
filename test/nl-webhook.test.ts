@@ -2,11 +2,14 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { test } from 'node:test';
+import type { SignalSpec } from '../src/shared/dsl.ts';
 import { validateSpec } from '../src/shared/dsl.ts';
 import { Db } from '../src/server/db.ts';
 import { extractJson, parseNaturalLanguage } from '../src/server/nl/parse.ts';
 import { parseWithRules } from '../src/server/nl/rules.ts';
 import { WebhookDispatcher, isPrivateAddress, sign } from '../src/server/webhook/delivery.ts';
+import { checkFeishuResponse, feishuSign, toFeishuMessage } from '../src/server/webhook/feishu.ts';
+import { isFeishuWebhook } from '../src/shared/webhook.ts';
 
 test('rules: core demo sentence', () => {
   const r = parseWithRules('BTC 最近 10 秒主动买入金额超过主动卖出金额 3 倍时调用我的 webhook。');
@@ -178,4 +181,114 @@ test('webhook: retries 5xx, stops on 4xx, signs body', async () => {
   assert.equal(blocked.ok, false);
   assert.match(blocked.error!, /private address/);
   server.close();
+});
+
+// ---------- 飞书机器人：专用格式 + 响应体判定（它出错也回 HTTP 200） ----------
+
+test('feishu: url detection', () => {
+  assert.ok(isFeishuWebhook('https://open.feishu.cn/open-apis/bot/v2/hook/abc'));
+  assert.ok(isFeishuWebhook('https://open.larksuite.com/open-apis/bot/v2/hook/abc'));
+  assert.ok(!isFeishuWebhook('https://open.feishu.cn/open-apis/im/v1/messages'));
+  assert.ok(!isFeishuWebhook('https://evil.com/open.feishu.cn/open-apis/bot/v2/hook/abc'));
+  assert.ok(!isFeishuWebhook('not a url'));
+});
+
+test('feishu: signature matches the official algorithm', () => {
+  // 参考值由飞书文档的 Python 示例独立计算：base64(hmac(key=f"{ts}\n{secret}", msg=b""))
+  assert.equal(feishuSign('demo', 1599360473), 'l1N0gAcBjdwBvGm1xMjOF0XSyaLRpR7tuO5dHfhAYc8=');
+  const m = toFeishuMessage({ event: 'signal.test', symbol: 'BTCUSDT' }, {}, 'demo', 1599360473_500);
+  assert.equal(m.timestamp, '1599360473');
+  assert.equal(m.sign, 'l1N0gAcBjdwBvGm1xMjOF0XSyaLRpR7tuO5dHfhAYc8=');
+  assert.equal('sign' in toFeishuMessage({}, {}, ''), false, '未配置 Secret 不带签名');
+});
+
+const T0 = Date.UTC(2026, 8, 30, 4, 5, 6); // 北京时间 12:05:06
+const tick = { E: T0, last: 82563, high: 84381.3, low: 82563, change: -1000, changePct: -0.01286, volume: 16686.17, quoteVolume: 1.4e9 };
+const extremeSpec = (dir: 'low' | 'high'): SignalSpec => ({
+  name: `btc-24h-new-${dir}`, title: `BTC 24h New ${dir}`, description: '', cooldown_ms: 60_000,
+  market: { exchange: 'binance', product: 'spot', symbol: 'BTCUSDT' },
+  metrics: [
+    { name: 'last_1s', kind: 'window', stream: 'aggTrade', window: '1s', filter: {}, field: 'price', aggregation: 'last' },
+    { name: `${dir}_24h`, kind: 'ticker', stream: 'ticker', field: `${dir}_24h` },
+  ],
+  condition: { left: 'last_1s', operator: dir === 'low' ? '<' : '>', right: { metric: `${dir}_24h`, multiplier: 1 } },
+});
+const ev = (spec: SignalSpec) => ({ event: 'signal.triggered', event_id: 7, signal: spec.name, title: spec.title, symbol: 'BTCUSDT', timestamp: T0, condition: 'c', metrics: {} });
+
+test('feishu: 24h new low → green card with the price that broke the old low', () => {
+  const spec = extremeSpec('low');
+  const m = toFeishuMessage(ev(spec), { spec, values: { last_1s: 82562.5, low_24h: 82563 }, ticker: tick }, '') as any;
+  assert.equal(m.msg_type, 'interactive');
+  assert.equal(m.card.header.title.content, '📉 BTC 24h 新低告警');
+  assert.equal(m.card.header.template, 'green');
+  const text = JSON.stringify(m.card.elements);
+  for (const s of ['**新低价格**\\n**82,562.5**', '**跌破的 24h 低**\\n82,563', '📉 -1.286%', '**24h 高**\\n**84,381.3**', '2026/9/30 12:05:06 Beijing', '24h 成交量 16,686.17', 'event #7', 'SignalForge']) {
+    assert.ok(text.includes(s), s);
+  }
+});
+
+test('feishu: 24h new high → red card', () => {
+  const spec = extremeSpec('high');
+  const m = toFeishuMessage(ev(spec), { spec, values: { last_1s: 84400, high_24h: 84381.3 }, ticker: tick }, '') as any;
+  assert.equal(m.card.header.title.content, '📈 BTC 24h 新高告警');
+  assert.equal(m.card.header.template, 'red');
+  assert.ok(JSON.stringify(m.card.elements).includes('**24h 低**'));
+});
+
+test('feishu: other signals (or an OR whose extreme leaf is false) use the generic card', () => {
+  const spec = extremeSpec('low');
+  spec.metrics.push({ name: 'pct', kind: 'ticker', stream: 'ticker', field: 'change_pct_24h' });
+  spec.condition = { op: 'or', conditions: [spec.condition, { left: 'pct', operator: '<=', right: { value: -0.01 } }] };
+  // 触发原因是跌幅分支，不是创新低：不能发"新低告警"
+  const m = toFeishuMessage({ ...ev(spec), title: 'BTC Drop', metrics: { last_1s: 83000, low_24h: 82563, pct: -0.012 } }, { spec, values: { last_1s: 83000, low_24h: 82563, pct: -0.012 }, ticker: tick }, '') as any;
+  assert.equal(m.card.header.title.content, '🔔 BTC Drop 触发');
+  assert.equal(m.card.header.template, 'orange');
+  assert.ok(JSON.stringify(m.card.elements).includes('**low_24h**\\n82,563'));
+});
+
+test('feishu: test message is a snapshot of the real ticker when available', () => {
+  const snap = toFeishuMessage({ event: 'signal.test', symbol: 'BTCUSDT', timestamp: T0 }, { ticker: tick }, '') as any;
+  assert.equal(snap.card.header.title.content, '📊 BTC 24h 状态快照');
+  assert.equal(snap.card.header.template, 'blue');
+  assert.ok(JSON.stringify(snap.card.elements).includes('**当前价格**\\n**82,563**'));
+  const bare = toFeishuMessage({ event: 'signal.test', symbol: 'BTCUSDT' }, {}, '') as any;
+  assert.equal(bare.card.header.title.content, '📊 SignalForge 测试消息');
+});
+
+test('feishu: response body decides success', () => {
+  assert.equal(checkFeishuResponse('{"code":0,"data":{},"msg":"success"}'), null);
+  assert.equal(checkFeishuResponse('{"Extra":null,"StatusCode":0,"StatusMessage":"success"}'), null);
+  assert.deepEqual(checkFeishuResponse('{"code":19021,"msg":"sign match fail"}'), { error: 'feishu code 19021: sign match fail', retriable: false });
+  assert.equal(checkFeishuResponse('{"code":11232,"msg":"frequency limited"}')!.retriable, true);
+  assert.equal(checkFeishuResponse('<html>')!.retriable, false);
+});
+
+test('feishu: HTTP 200 with error code is logged as a failed delivery', async () => {
+  const realFetch = globalThis.fetch;
+  const sent: any[] = [];
+  const replies = ['{"code":19002,"msg":"params error, msg_type need"}', '{"code":0,"msg":"success"}'];
+  globalThis.fetch = (async (_url: string, init: RequestInit) => {
+    sent.push({ headers: init.headers, body: JSON.parse(String(init.body)) });
+    return new Response(replies[sent.length - 1], { status: 200 });
+  }) as typeof fetch;
+  try {
+    const db = new Db(':memory:');
+    const id = db.insertWebhook({ name: 'ai-lab', url: 'https://open.feishu.cn/open-apis/bot/v2/hook/xxxxx', method: 'POST', headers: {}, secret: 'demo', timeout_ms: 2000, max_retries: 3 });
+    const d = new WebhookDispatcher(db, true, () => {}, [10, 10, 10]);
+    const w = db.getWebhook(id)!;
+
+    const bad = await d.deliver(w, { event: 'signal.test', symbol: 'BTCUSDT' }, null, true);
+    assert.equal(bad.ok, false, '200 + code≠0 不能记为成功');
+    assert.equal(bad.http_status, 200);
+    assert.match(bad.error!, /feishu code 19002/);
+    assert.equal(bad.attempts, 1, '业务错误不重试');
+
+    const good = await d.deliver(w, { event: 'signal.test', symbol: 'BTCUSDT' }, null, true);
+    assert.equal(good.ok, true);
+    assert.equal(sent[1].body.msg_type, 'interactive');
+    assert.ok(sent[1].body.sign, '请求体带飞书签名');
+    assert.equal((sent[1].headers as Record<string, string>)['x-signalforge-signature'], undefined);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });

@@ -3,12 +3,16 @@
  * - 签名：X-SignalForge-Signature: sha256=HMAC_SHA256(secret, `${timestamp}.${body}`)
  * - 重试：网络错误 / 超时 / 5xx / 408 / 429 可重试，按 1s / 5s / 30s 退避；其余 4xx 不重试
  * - 安全：默认拒绝解析到内网 / 回环 / 链路本地地址的 URL，且不跟随重定向（防 SSRF）
+ * - 飞书机器人地址按飞书格式投递并校验响应体（见 feishu.ts）：它出错也回 HTTP 200
  */
 import { createHmac } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { RETRY_DELAYS_MS } from '../../shared/dsl.ts';
+import { isFeishuWebhook } from '../../shared/webhook.ts';
 import type { Db, WebhookRow } from '../db.ts';
+import type { FeishuContext, FeishuSource } from './feishu.ts';
+import { checkFeishuResponse, toFeishuMessage } from './feishu.ts';
 
 export interface AttemptResult {
   ok: boolean;
@@ -57,13 +61,15 @@ export async function attempt(w: WebhookRow, body: string, allowPrivate: boolean
     return { ok: false, http_status: null, latency_ms: null, error: (e as Error).message, retriable: false };
   }
   const ts = Date.now();
+  const feishu = isFeishuWebhook(w.url);
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     'user-agent': 'SignalForge-Webhook/1.0',
     'x-signalforge-timestamp': String(ts),
     ...w.headers,
   };
-  if (w.secret) headers['x-signalforge-signature'] = sign(w.secret, ts, body);
+  // 飞书的 Secret 是它自己的签名校验密钥，签名已在请求体里，不再附加 SignalForge 签名头
+  if (w.secret && !feishu) headers['x-signalforge-signature'] = sign(w.secret, ts, body);
   try {
     const res = await fetch(w.url, {
       method: w.method,
@@ -73,8 +79,13 @@ export async function attempt(w: WebhookRow, body: string, allowPrivate: boolean
       signal: AbortSignal.timeout(w.timeout_ms),
     });
     const latency = Math.round(performance.now() - started);
+    const httpOk = res.status >= 200 && res.status < 300;
+    if (feishu && httpOk) {
+      const bad = checkFeishuResponse(await res.text());
+      return { ok: !bad, http_status: res.status, latency_ms: latency, error: bad?.error ?? null, retriable: bad?.retriable ?? false };
+    }
     await res.body?.cancel().catch(() => {});
-    const ok = res.status >= 200 && res.status < 300;
+    const ok = httpOk;
     return {
       ok,
       http_status: res.status,
@@ -104,8 +115,16 @@ export class WebhookDispatcher {
   ) {}
 
   /** 投递并按策略重试，每次尝试都写入日志；返回最终是否成功 */
-  async deliver(w: WebhookRow, payload: unknown, eventId: number | null, isTest = false): Promise<AttemptResult & { attempts: number }> {
-    const body = JSON.stringify(payload);
+  /** feishu：通用 payload 之外、仅供飞书卡片使用的上下文（spec / 触发值 / ticker），不影响其他 Webhook 的报文 */
+  async deliver(
+    w: WebhookRow,
+    payload: unknown,
+    eventId: number | null,
+    isTest = false,
+    feishu: FeishuContext = {},
+  ): Promise<AttemptResult & { attempts: number }> {
+    // 飞书签名的时间戳须在 1 小时内，整轮重试最长约 36s，生成一次即可
+    const body = JSON.stringify(isFeishuWebhook(w.url) ? toFeishuMessage(payload as FeishuSource, feishu, w.secret) : payload);
     const maxAttempts = 1 + Math.min(w.max_retries, this.delays.length);
     let last!: AttemptResult;
     for (let n = 1; n <= maxAttempts; n++) {

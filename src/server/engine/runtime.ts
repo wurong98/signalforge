@@ -277,7 +277,7 @@ export class Runtime extends EventEmitter {
       metrics,
     };
     this.dispatcher
-      .deliver(webhook, payload, id)
+      .deliver(webhook, payload, id, false, { spec, values: r.values, ticker: this.windows.get(spec.market.symbol)?.ticker24h })
       .then((res) => this.db.setEventDelivery(id, res.ok ? 'success' : 'failed'))
       .catch((e) => {
         console.error('[webhook] dispatcher crashed', e);
@@ -380,6 +380,14 @@ export class Runtime extends EventEmitter {
 
   allStatus(): RunnerStatus[] {
     return this.db.listSignals().map((s) => this.status(s.id)!);
+  }
+
+  /** 最新的 24h ticker 快照：优先指定交易对，否则取任一已有快照的交易对（飞书测试卡片用真实行情） */
+  latestTicker(prefer = 'BTCUSDT'): { symbol: string; ticker: Ticker } | null {
+    const t = this.windows.get(prefer)?.ticker24h;
+    if (t) return { symbol: prefer, ticker: t };
+    for (const [symbol, w] of this.windows) if (w.ticker24h) return { symbol, ticker: w.ticker24h };
+    return null;
   }
 
   symbols() {
