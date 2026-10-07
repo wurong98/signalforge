@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { SymbolDirectory } from '../src/server/binance/symbols.ts';
 import { Db } from '../src/server/db.ts';
 import type { ChatTurn } from '../src/server/nl/chat.ts';
 import { MAX_ROUNDS, runChat, trimHistory } from '../src/server/nl/chat.ts';
@@ -41,7 +42,9 @@ function fixture() {
       { symbol: 'ETHUSDT', ready_60s: false, buffer: 1, last_trade: null, exchange_now: NOW, ticker_24h: null },
     ],
     snapshot: (symbol, names) =>
-      Object.fromEntries(names.map((n) => [n, symbol === 'BTCUSDT' ? ({ buy_notional_10s: 500, return_5m: 0.025 } as Record<string, number>)[n] ?? null : null])),
+      Object.fromEntries(
+        names.map((n) => [n, symbol === 'BTCUSDT' ? ({ buy_notional_10s: 500, return_5m: 0.025, ticker_quote_volume_24h: 1.5e9 } as Record<string, number>)[n] ?? null : null]),
+      ),
     status: () => null,
   };
   const deps: ToolDeps = { runtime, db, retentionDays: 7, now: () => NOW, tz: 'Asia/Shanghai' };
@@ -50,34 +53,34 @@ function fixture() {
 
 const call = (deps: ToolDeps, name: string, args: unknown) => runTool(name, JSON.stringify(args), deps);
 
-test('tools: 每个工具都能声明为 JSON Schema', () => {
+test('tools: 每个工具都能声明为 JSON Schema', async () => {
   const ts = llmTools();
   assert.equal(ts.length, TOOLS.length);
   for (const t of ts) assert.equal((t.function.parameters as any).type, 'object');
 });
 
-test('tools: snapshot 百分比换算、null 不补 0、未订阅拒答', () => {
+test('tools: snapshot 百分比换算、null 不补 0、未订阅拒答', async () => {
   const { deps } = fixture();
-  const r = call(deps, 'market_snapshot', { symbol: 'btcusdt', metrics: ['return_5m', 'buy_notional_10s', 'sell_notional_10s'] });
+  const r = (await call(deps, 'market_snapshot', { symbol: 'btcusdt', metrics: ['return_5m', 'buy_notional_10s', 'sell_notional_10s'] }));
   assert.ok(r.ok);
   const m = (r.result as any).metrics;
   assert.deepEqual(m.return_5m, { value: 2.5, unit: '%' });
   assert.deepEqual(m.buy_notional_10s, { value: 500, unit: 'USDT' });
   assert.equal(m.sell_notional_10s.value, null);
-  assert.equal((call(deps, 'market_snapshot', { symbol: 'SOLUSDT' }).result as any).error, 'not_subscribed');
-  assert.equal((call(deps, 'market_snapshot', { symbol: 'BTCUSDT', metrics: ['nope'] }).result as any).error, 'unknown_metric');
+  assert.equal(((await call(deps, 'market_snapshot', { symbol: 'SOLUSDT' })).result as any).error, 'not_subscribed');
+  assert.equal(((await call(deps, 'market_snapshot', { symbol: 'BTCUSDT', metrics: ['nope'] })).result as any).error, 'unknown_metric');
 });
 
-test('tools: rank_symbols 把无数据的交易对单列', () => {
+test('tools: rank_symbols 把无数据的交易对单列', async () => {
   const { deps } = fixture();
-  const r = call(deps, 'rank_symbols', { metric: 'buy_notional_10s' }).result as any;
+  const r = (await call(deps, 'rank_symbols', { metric: 'buy_notional_10s' })).result as any;
   assert.deepEqual(r.ranking.map((x: any) => x.symbol), ['BTCUSDT']);
   assert.deepEqual(r.unavailable, ['ETHUSDT']);
 });
 
-test('tools: metric_stats 统计 + 超出保留期拒答（不给部分结果）', () => {
+test('tools: metric_stats 统计 + 超出保留期拒答（不给部分结果）', async () => {
   const { deps } = fixture();
-  const r = call(deps, 'metric_stats', { symbol: 'BTCUSDT', metric: 'return_60s', lookback_minutes: 60 });
+  const r = (await call(deps, 'metric_stats', { symbol: 'BTCUSDT', metric: 'return_60s', lookback_minutes: 60 }));
   assert.ok(r.ok);
   const s = r.result as any;
   assert.equal(s.max.value, 0.4);
@@ -85,43 +88,94 @@ test('tools: metric_stats 统计 + 超出保留期拒答（不给部分结果）
   assert.equal(s.last.value, -0.2);
   assert.equal(s.unit, '%');
   assert.equal(s.max.at, '2026-10-07 19:55:00');
-  const old = call(deps, 'metric_stats', { symbol: 'BTCUSDT', metric: 'return_60s', lookback_minutes: 8 * 1440 });
+  const old = (await call(deps, 'metric_stats', { symbol: 'BTCUSDT', metric: 'return_60s', lookback_minutes: 8 * 1440 }));
   assert.equal(old.ok, false);
   assert.equal((old.result as any).error, 'insufficient_data');
-  assert.equal((call(deps, 'metric_stats', { symbol: 'SOLUSDT', metric: 'return_60s', lookback_minutes: 60 }).result as any).error, 'no_data');
+  assert.equal(((await call(deps, 'metric_stats', { symbol: 'SOLUSDT', metric: 'return_60s', lookback_minutes: 60 })).result as any).error, 'no_data');
 });
 
-test('tools: 事件永久保留，超过 7 天也能统计；按小时分桶用用户时区', () => {
+test('tools: 事件永久保留，超过 7 天也能统计；按小时分桶用用户时区', async () => {
   const { deps, sid } = fixture();
-  const r = call(deps, 'event_stats', { lookback_minutes: 60 * 1440, by_hour: true }).result as any;
+  const r = (await call(deps, 'event_stats', { lookback_minutes: 60 * 1440, by_hour: true })).result as any;
   assert.equal(r.total, 3);
   assert.equal(r.per_signal[0].signal_id, sid);
   assert.ok(r.per_signal[0].title);
   assert.deepEqual(r.by_hour.at(-1), { hour: '2026-10-07 18:00', count: 2 });
-  const recent = call(deps, 'list_events', { lookback_minutes: 180 }).result as any;
+  const recent = (await call(deps, 'list_events', { lookback_minutes: 180 })).result as any;
   assert.equal(recent.events.length, 2);
   assert.equal(recent.events[0].leaves[0].left, 300000);
 });
 
-test('tools: 输出不含 webhook url / headers / secret', () => {
+test('tools: 输出不含 webhook url / headers / secret', async () => {
   const { deps, sid } = fixture();
   const all = [
-    ...TOOLS.map((t) => call(deps, t.name, { symbol: 'BTCUSDT', metric: 'return_60s', id: sid, lookback_minutes: 60 * 1440 })),
-    call(deps, 'delivery_failures', { lookback_minutes: 60 * 1440 }),
+    ...(await Promise.all(TOOLS.map((t) => call(deps, t.name, { symbol: 'BTCUSDT', metric: 'return_60s', id: sid, lookback_minutes: 60 * 1440 })))),
+    (await call(deps, 'delivery_failures', { lookback_minutes: 60 * 1440 })),
   ];
   const text = JSON.stringify(all);
   for (const leak of ['secret-leak', 'header-leak', 'token=leak', 'hooks.example.com']) assert.ok(!text.includes(leak), leak);
-  const f = call(deps, 'delivery_failures', { lookback_minutes: 180 }).result as any;
+  const f = (await call(deps, 'delivery_failures', { lookback_minutes: 180 })).result as any;
   assert.equal(f.failures[0].webhook, 'my-hook');
   assert.equal(f.failures[0].http_status, 500);
 });
 
-test('tools: 参数错误作为结果回灌而不是抛出', () => {
+test('tools: 参数错误作为结果回灌而不是抛出', async () => {
   const { deps } = fixture();
-  assert.equal((runTool('metric_stats', '{"symbol":1}', deps).result as any).error, 'bad_args');
-  assert.equal((runTool('metric_stats', 'not json', deps).result as any).error, 'bad_args');
-  assert.equal((runTool('drop_table', '{}', deps).result as any).error, 'unknown_tool');
-  assert.equal((call(deps, 'event_stats', {}).result as any).error, 'bad_args');
+  assert.equal(((await runTool('metric_stats', '{"symbol":1}', deps)).result as any).error, 'bad_args');
+  assert.equal(((await runTool('metric_stats', 'not json', deps)).result as any).error, 'bad_args');
+  assert.equal(((await runTool('drop_table', '{}', deps)).result as any).error, 'unknown_tool');
+  assert.equal(((await call(deps, 'event_stats', {})).result as any).error, 'bad_args');
+});
+
+test('tools: list_symbols 带 24h 成交额', async () => {
+  const { deps } = fixture();
+  const r = (await call(deps, 'list_symbols', {})).result as any;
+  assert.equal(r.symbols[0].ticker_24h.quote_volume, 1.5e9);
+  assert.equal(r.symbols[0].ticker_24h.change_pct, 1.23);
+});
+
+test('tools: search_binance_symbols 区分"可监控"与"已订阅"', async () => {
+  const { deps } = fixture();
+  deps.directory = {
+    list: async () => [
+      { symbol: 'BTCUSDT', base: 'BTC', quote: 'USDT' },
+      { symbol: 'XPLUSDT', base: 'XPL', quote: 'USDT' },
+      { symbol: 'XPLBTC', base: 'XPL', quote: 'BTC' },
+      { symbol: 'ETHBTC', base: 'ETH', quote: 'BTC' },
+    ],
+  };
+  const r = (await call(deps, 'search_binance_symbols', { query: 'xpl' })).result as any;
+  assert.equal(r.total_trading_spot, 4);
+  assert.equal(r.in_quote, 2);
+  assert.deepEqual(r.matches, [{ symbol: 'XPLUSDT', subscribed: false }]);
+  assert.deepEqual(r.subscribed, ['BTCUSDT', 'ETHUSDT']);
+  const any = (await call(deps, 'search_binance_symbols', { query: 'XPL', quote: 'all' })).result as any;
+  assert.equal(any.match_count, 2);
+  deps.directory = { list: async () => Promise.reject(new Error('offline')) };
+  assert.equal(((await call(deps, 'search_binance_symbols', {})).result as any).error, 'unavailable');
+});
+
+test('symbols: exchangeInfo 只保留 TRADING，缓存 1 小时，失败沿用旧缓存', async () => {
+  let n = 0;
+  let fail = false;
+  let now = 0;
+  const fake = (async () => {
+    n++;
+    if (fail) throw new Error('down');
+    return new Response(JSON.stringify({ symbols: [
+      { symbol: 'BTCUSDT', baseAsset: 'BTC', quoteAsset: 'USDT', status: 'TRADING' },
+      { symbol: 'OLDUSDT', baseAsset: 'OLD', quoteAsset: 'USDT', status: 'BREAK' },
+    ] }));
+  }) as typeof fetch;
+  const dir = new SymbolDirectory('https://x', fake, () => now);
+  assert.deepEqual((await dir.list()).map((s) => s.symbol), ['BTCUSDT']);
+  await dir.list();
+  assert.equal(n, 1);
+  now = 2 * H;
+  fail = true;
+  assert.equal((await dir.list()).length, 1);
+  assert.equal(n, 2);
+  await assert.rejects(new SymbolDirectory('https://x', fake).list());
 });
 
 // ---------- 对话循环 ----------
@@ -202,7 +256,7 @@ test('chat: 历史中的 digest 回传给模型；截断后首条必须是 user'
   await assert.rejects(runChat([{ role: 'assistant', content: 'x' }], { call: fn, tools: deps }));
 });
 
-test('llm: thinking 参数只发给认识它的端点', () => {
+test('llm: thinking 参数只发给认识它的端点', async () => {
   const base = { baseUrl: 'https://api.deepseek.com', apiKey: 'k', model: 'deepseek-flash' };
   assert.deepEqual(buildRequestBody({ ...base, thinkingParam: true }, [], { thinking: false }).thinking, { type: 'disabled' });
   assert.deepEqual(buildRequestBody({ ...base, thinkingParam: true }, [], { thinking: true }).thinking, { type: 'enabled' });

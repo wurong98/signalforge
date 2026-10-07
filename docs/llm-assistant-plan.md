@@ -195,5 +195,6 @@ for round in 0..MAX_ROUNDS(6):
 
 - P1 只实现原生 tools 协议，未做 JSON 回落；若 deepseek-flash 实测工具调用不稳定再补。
 - `rest_ticker_24h`（未订阅交易对）留在 P3；P1 对未订阅交易对返回 `not_subscribed`。
+- 新增 `search_binance_symbols`（REST exchangeInfo，`binance/symbols.ts` 缓存 1 小时）：回答"支持哪些交易对"，区分"可监控（币安现货所有 TRADING 交易对）"与"已订阅（当前有指标）"。起因：实测中助手把已订阅的 2 个交易对当成了全部支持列表。
 - `metric_stats` 不要求交易对当前已订阅（取消订阅前的历史仍可查），无数据返回 `no_data`。
 - 本机无外网，P1 只用单测 + 本地假 LLM 验证了 `/api/chat` 链路（鉴权、工具调用、thinking=disabled 下发）。
