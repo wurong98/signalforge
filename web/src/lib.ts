@@ -1,5 +1,10 @@
 import { createContext, useContext, useEffect, useState } from 'react';
+import type { WebBuild } from '../../src/shared/build.ts';
 import type { SignalSpec } from '../../src/shared/dsl.ts';
+
+/** vite 构建时写入（vite.config.ts 的 define） */
+declare const __WEB_BUILD__: WebBuild;
+export const WEB_BUILD = __WEB_BUILD__;
 
 // ---------- API ----------
 export class ApiError extends Error {

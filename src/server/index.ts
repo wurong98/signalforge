@@ -3,12 +3,14 @@ import { networkInterfaces } from 'node:os';
 import { resolve } from 'node:path';
 import fastifyStatic from '@fastify/static';
 import Fastify from 'fastify';
+import { formatBuild } from '../shared/build.ts';
 import { registerApi } from './api.ts';
 import { Auth, registerAuth } from './auth.ts';
 import { BinanceHub } from './binance/stream.ts';
 import { config } from './config.ts';
 import { Db } from './db.ts';
 import { Runtime } from './engine/runtime.ts';
+import { readBuildInfo } from './version.ts';
 import { WebhookDispatcher } from './webhook/delivery.ts';
 
 const db = new Db(config.dbPath);
@@ -16,11 +18,13 @@ const hub = new BinanceHub(config.binanceWs);
 const dispatcher = new WebhookDispatcher(db, config.allowPrivateWebhooks);
 const runtime = new Runtime(db, hub, dispatcher, config.symbols, config.metricRetentionDays);
 
+const build = { ...readBuildInfo(), started_at: Date.now() };
+
 const app = Fastify({ logger: { level: 'warn' } });
 const auth = new Auth(config.adminFile);
 // 必须先于业务路由注册：onRequest 钩子拦截所有未鉴权的 /api 请求
 registerAuth(app, auth);
-registerApi(app, { db, runtime, hub, dispatcher });
+registerApi(app, { db, runtime, hub, dispatcher, build });
 
 const webDir = resolve('dist/web');
 if (existsSync(webDir)) {
@@ -33,7 +37,7 @@ if (existsSync(webDir)) {
 
 runtime.start();
 await app.listen({ port: config.port, host: config.host });
-console.log(`SignalForge listening on http://${config.host}:${config.port}`);
+console.log(`SignalForge ${formatBuild(build)} listening on http://${config.host}:${config.port}`);
 if (config.host === '0.0.0.0' || config.host === '::') {
   for (const addrs of Object.values(networkInterfaces()))
     for (const a of addrs ?? []) if (a.family === 'IPv4' && !a.internal) console.log(`  LAN: http://${a.address}:${config.port}`);

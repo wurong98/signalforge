@@ -1,7 +1,8 @@
 import { type FormEvent, StrictMode, useCallback, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter, NavLink, Route, Routes } from 'react-router-dom';
-import { LiveContext, UNAUTHORIZED_EVENT, api, fmtAgo, useLive, useLiveSource, useNow } from './lib.ts';
+import { type ServerBuild, checkBuilds, formatBuild } from '../../src/shared/build.ts';
+import { LiveContext, UNAUTHORIZED_EVENT, WEB_BUILD, api, fmtAgo, fmtDateTime, useLive, useLiveSource, useNow } from './lib.ts';
 import { CreatePage } from './pages/Create.tsx';
 import { DataSourcesPage } from './pages/DataSources.tsx';
 import { ExplorePage } from './pages/Explore.tsx';
@@ -30,6 +31,23 @@ function LiveStatus() {
         </span>
       ))}
     </div>
+  );
+}
+
+/** 页面底部版本：确认服务器上跑的是哪个 commit，前端构建与服务进程不一致时标红 */
+function BuildFooter() {
+  const [server, setServer] = useState<ServerBuild | null>(null);
+  useEffect(() => {
+    api<ServerBuild>('/version').then(setServer).catch(() => {});
+  }, []);
+  const check = server ? checkBuilds(WEB_BUILD, server) : { level: 'ok' as const };
+  return (
+    <footer className="build-footer mono">
+      <span>{formatBuild(server ?? WEB_BUILD)}</span>
+      {server && <span>启动于 {fmtDateTime(server.started_at).slice(0, 16)}</span>}
+      <span>构建于 {fmtDateTime(WEB_BUILD.built_at).slice(0, 16)}</span>
+      {check.level !== 'ok' && <span className={check.level === 'bad' ? 'bad-text' : 'warn-text'}>⚠ {check.message}</span>}
+    </footer>
   );
 }
 
@@ -132,6 +150,7 @@ function App({ onLogout }: { onLogout: () => void }) {
             <Route path="/data-sources" element={<DataSourcesPage />} />
           </Routes>
         </main>
+        <BuildFooter />
       </BrowserRouter>
     </LiveContext.Provider>
   );
