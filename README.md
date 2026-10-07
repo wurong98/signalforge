@@ -18,6 +18,8 @@ npm run build && npm start   # http://127.0.0.1:8787
 npm run dev
 ```
 
+首次打开页面时需要设置**管理密码**，之后所有访问都要先输入它。密码哈希保存在 `data/admin.json`（`ADMIN_FILE`），忘记密码时删除该文件、刷新页面即可重新设置。脚本调用 API 时带 `Authorization: Bearer <管理密码>`。
+
 本地测试 Webhook 时，接收端通常在 localhost，需要设置 `ALLOW_PRIVATE_WEBHOOKS=true`（默认禁止，防 SSRF）。
 
 需要 Node ≥ 22.13（使用内置 `node:sqlite` 与 `WebSocket`，无原生依赖）。

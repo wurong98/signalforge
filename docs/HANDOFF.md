@@ -44,13 +44,14 @@
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 不配置则只用规则解析（仅支持"买卖 N 倍"与"涨跌 N%"句式）。也会回退读取 `OPENAI_BASE_URL` / `OPENAI_API_KEY` |
 | `BINANCE_WS_URL` | 被墙环境可改为 `wss://data-stream.binance.vision` |
 | `ALLOW_PRIVATE_WEBHOOKS` | 本地测试需设为 `true` |
-| `HOST` | 默认 `127.0.0.1`；**没有鉴权，不要直接改成 0.0.0.0 暴露公网** |
+| `HOST` | 默认 `127.0.0.1`。公网部署前务必先完成管理密码设置，并在前面放 HTTPS 反代 |
+| `ADMIN_FILE` | 管理密码哈希文件，默认 `./data/admin.json`。首次打开页面时设置；忘记密码删除此文件即可重设 |
 
 ## 4. 已知问题与限制
 
 | 类别 | 问题 | 建议 |
 |------|------|------|
-| 安全 | 无用户鉴权（PRD §27 仅要求简单模型） | 公网部署前加鉴权（至少 Basic Auth / Token） |
+| 安全 | 单一管理密码，无多用户；首次设置前任何人都能抢先设置 | 公网部署后立即打开页面完成设置；需要多用户时再扩展 |
 | 安全 | DNS rebinding 可绕过 SSRF 检查（校验与连接之间存在 TOCTOU） | 生产环境让 Webhook 走出口代理，或在 `undici` 的 connect 阶段校验 IP |
 | 可靠性 | 进程重启时正在重试的 Webhook 会丢失（重试队列在内存中） | 事件的 `delivery_status` 会停留在 `pending`；可在启动时扫描并重投 |
 | 可靠性 | 单连接承载所有交易对；新增交易对通过 SUBSCRIBE，但 Binance 单连接上限 1024 streams | 多交易对规模化时分片连接 |
@@ -64,9 +65,8 @@
 
 1. **触发频率预估**：Create 页 Preview 显示"过去 1 小时会触发几次"。可基于 `metric_points` 或内存中的原始成交回放实现，复用 `SignalStateMachine`。
 2. **启动时重投 pending 的 Webhook**（见第 4 节）。
-3. **鉴权**：最小实现为环境变量 token + Fastify preHandler。
-4. **P2 数据源**：bookTicker（spread / spread_bps）→ depth（订单簿重建 + depth_imbalance）。DSL 的 `stream` 目前是字面量 `'aggTrade'`，需扩展为联合类型，窗口引擎需要支持非成交类事件。
-5. Signal 事件记录"退出满足"的时间（持续时长）。
+3. **P2 数据源**：bookTicker（spread / spread_bps）→ depth（订单簿重建 + depth_imbalance）。DSL 的 `stream` 目前是字面量 `'aggTrade'`，需扩展为联合类型，窗口引擎需要支持非成交类事件。
+4. Signal 事件记录"退出满足"的时间（持续时长）。
 
 ## 6. 如何接手
 

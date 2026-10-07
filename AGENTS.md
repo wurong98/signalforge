@@ -40,6 +40,7 @@ Binance Signal Studio：自然语言 → Signal DSL → 确定性 Runtime（Bina
    - 用到 ticker 的 Signal 必须等到**第一条 ticker 到达**才算就绪（`requiresTicker()`）。否则就绪瞬间 ticker 还是 null（条件假 → ARMED），下一秒 ticker 到达、条件转真，会被误判成边沿而触发，直接破坏不变量 5；
    - 断线时 ticker 快照随窗口一起作废（`markDisconnected()` 清空），重连后同样要等第一条新 ticker。旧快照不含断线期间的行情，拿它判就绪会把"断线期间已满足"的条件当成边沿触发，旧极值还会导致误报新低/新高；
    - 创新低/新高用**严格**不等号（`last_1s < low_24h`）。成交价"等于"极值只是恰好停在那儿；用 `<=` 会让条件在整段下跌中持续为真，整个过程只在第一次反弹时触发一次，限频就完全失效了。代价是：若某次 ticker 比 aggTrade 先到、已经包含了这笔新极值，这次会漏报（只会漏、不会误报，下一次创新低照常触发）。
+10. **所有 `/api/*` 必须经过管理密码鉴权**（`src/server/auth.ts` 的 onRequest 钩子，须先于业务路由注册），仅 `/api/auth/{status,login,setup}` 例外。新增接口不得绕过；未设置密码时同样拦截。密码哈希在 `ADMIN_FILE`（默认 `data/admin.json`），删除即重置。
 
 ## 代码地图
 
@@ -49,6 +50,7 @@ src/shared/catalog.ts        内置指标（Explore / 提示词），含 24h tic
 src/server/index.ts          入口：组装 Db / BinanceHub / Dispatcher / Runtime / Fastify
 src/server/config.ts         环境变量
 src/server/api.ts            REST + SSE（/api/live 每秒推送状态）
+src/server/auth.ts           管理密码（首次设置 / 文件存储）+ 会话 Cookie + 登录限流
 src/server/db.ts             node:sqlite，表：webhooks signals events deliveries metric_points
 src/server/binance/stream.ts WS 连接（每对同时订阅 aggTrade + ticker）、重连、假死检测、环形缓存
 src/server/engine/window.ts  增量滑动窗口累加器 + 24h ticker 快照
@@ -72,7 +74,8 @@ docs/                        PRD 评审、交接文档
 ## 验证改动
 
 - 引擎/解析/Webhook 逻辑：加单元测试到 `test/`。
-- 端到端：`ALLOW_PRIVATE_WEBHOOKS=true PORT=8799 DB_PATH=/tmp/x.db npx tsx src/server/index.ts`，
-  用 `curl -XPOST localhost:8799/api/signals` 建一个低阈值 Signal（如 1s 窗口、`multiplier: 1.5`、cooldown 3s）
+- 端到端：`ALLOW_PRIVATE_WEBHOOKS=true PORT=8799 DB_PATH=/tmp/x.db ADMIN_FILE=/tmp/admin.json npx tsx src/server/index.ts`，
+  先 `curl -XPOST localhost:8799/api/auth/setup -H 'content-type: application/json' -d '{"password":"testpass123"}'` 设置密码，
+  之后请求都带 `-H 'authorization: Bearer testpass123'`；用 `curl -XPOST localhost:8799/api/signals` 建一个低阈值 Signal（如 1s 窗口、`multiplier: 1.5`、cooldown 3s）
   指向本地 HTTP 接收端，30 秒内应收到签名的 Webhook。
 - 注意：`pkill -f "tsx src/server"` 可能误杀自己的 shell，按端口查 pid 再 kill。
