@@ -299,6 +299,16 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
   });
 
   // ---------- Data Sources ----------
+  // 全部可监控交易对（exchangeInfo TRADING），供 Data Sources 页自行搜索浏览
+  app.get('/api/binance/symbols', async (_req, reply) => {
+    try {
+      const subscribed = new Set(runtime.symbols().map((s) => s.symbol));
+      const list = await directory.list();
+      return { symbols: list.map((s) => ({ ...s, subscribed: subscribed.has(s.symbol) })) };
+    } catch (e) {
+      return bad(reply, `无法获取 Binance 交易对列表：${(e as Error).message}`, 502);
+    }
+  });
   app.get('/api/datasources', async () => {
     const h = hub.getStatus();
     // 每个交易对有 aggTrade / ticker 两条流，样例按 `SYMBOL@stream` 区分

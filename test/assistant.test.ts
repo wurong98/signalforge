@@ -144,13 +144,23 @@ test('tools: search_binance_symbols 区分"可监控"与"已订阅"', async () =
       { symbol: 'ETHBTC', base: 'ETH', quote: 'BTC' },
     ],
   };
-  const r = (await call(deps, 'search_binance_symbols', { query: 'xpl' })).result as any;
+  const r = (await call(deps, 'search_binance_symbols', { query: 'xpl', quote: 'usdt' })).result as any;
   assert.equal(r.total_trading_spot, 4);
   assert.equal(r.in_quote, 2);
   assert.deepEqual(r.matches, [{ symbol: 'XPLUSDT', subscribed: false }]);
   assert.deepEqual(r.subscribed, ['BTCUSDT', 'ETHUSDT']);
-  const any = (await call(deps, 'search_binance_symbols', { query: 'XPL', quote: 'all' })).result as any;
+  // 带 query 不指定 quote 时跨所有计价币
+  const any = (await call(deps, 'search_binance_symbols', { query: 'XPL' })).result as any;
   assert.equal(any.match_count, 2);
+  // 0 命中给近似建议
+  const miss = (await call(deps, 'search_binance_symbols', { query: 'XPK' })).result as any;
+  assert.equal(miss.match_count, 0);
+  assert.deepEqual(miss.similar, ['XPL']);
+  // list=true 返回完整清单（默认 USDT）
+  const list = (await call(deps, 'search_binance_symbols', { list: true })).result as any;
+  assert.deepEqual(list.symbols, ['BTCUSDT', 'XPLUSDT']);
+  const listAll = (await call(deps, 'search_binance_symbols', { list: true, quote: 'ALL' })).result as any;
+  assert.equal(listAll.symbols.length, 4);
   deps.directory = { list: async () => Promise.reject(new Error('offline')) };
   assert.equal(((await call(deps, 'search_binance_symbols', {})).result as any).error, 'unavailable');
 });

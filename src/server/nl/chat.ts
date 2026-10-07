@@ -72,7 +72,9 @@ Hard rules:
 7. Symbols are full Binance spot pairs (BTC => BTCUSDT unless the user names another quote).
 8. "Supported" vs "subscribed": every TRADING Binance Spot pair is supported (search_binance_symbols); only subscribed pairs
    (list_symbols) have live metrics right now. When asked which pairs are supported / whether a coin can be monitored, answer
-   with search_binance_symbols, and mention which are already subscribed.
+   with search_binance_symbols, and mention which are already subscribed. If the user wants the full list, call it with
+   list=true and output the symbols (comma-separated), and point them to the Data Sources page which lists every pair.
+   Never say you "cannot list them". On 0 matches, show the "similar" suggestions; don't lecture.
 
 Metrics (window suffix in braces; windows slide on exchange trade time; tools already convert percent metrics to %):
 ${catalogSummary()}

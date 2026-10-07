@@ -101,6 +101,33 @@ function requireMetrics(names: string[]) {
   if (bad.length) throw new ToolError({ error: 'unknown_metric', unknown: bad, valid: CATALOG.map((m) => m.name) });
 }
 
+/** 编辑距离（短串用，无需优化） */
+function editDistance(a: string, b: string): number {
+  const dp = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cur = dp[j];
+      dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = cur;
+    }
+  }
+  return dp[b.length];
+}
+
+/** 近似 base：编辑距离小，或与查询共享前 3 个字符；按距离排序取前 10 */
+export function similarBases(q: string, bases: string[]): string[] {
+  const maxD = q.length <= 4 ? 1 : 2;
+  const head = q.length >= 3 ? q.slice(0, 3) : null;
+  return [...new Set(bases)]
+    .map((b) => ({ b, d: editDistance(q, b) }))
+    .filter((x) => x.d <= maxD || (head && x.b.startsWith(head)))
+    .sort((x, y) => x.d - y.d || x.b.localeCompare(y.b))
+    .slice(0, 10)
+    .map((x) => x.b);
+}
+
 // ---------- 工具定义 ----------
 
 interface ToolDef<S extends z.ZodObject> {
@@ -144,10 +171,13 @@ export const TOOLS = [
     name: 'search_binance_symbols',
     description:
       'Binance Spot pairs currently TRADING (from exchangeInfo) — i.e. what the user CAN monitor. Any of them can get a Signal; ' +
-      'creating a Signal subscribes it automatically, and only then do metrics exist. Filter by base asset / symbol text and quote asset.',
+      'creating a Signal subscribes it automatically, and only then do metrics exist. ' +
+      'With query: substring match on symbol/base across ALL quotes unless quote is given; no hit → "similar" suggestions. ' +
+      'With list=true: the full symbol list for the quote (default USDT; "ALL" for every pair) — use it when the user asks to see all pairs.',
     schema: z.object({
-      query: z.string().trim().toUpperCase().max(20).optional().describe('base asset or symbol fragment, e.g. XPL, PEPE; omit for totals only'),
-      quote: z.string().trim().toUpperCase().max(10).default('USDT').describe('quote asset filter; "ALL" for any'),
+      query: z.string().trim().toUpperCase().max(20).optional().describe('base asset or symbol fragment, e.g. XPL, PEPE'),
+      quote: z.string().trim().toUpperCase().max(10).optional().describe('quote asset filter, e.g. USDT; "ALL" for any. Default: ALL with query, USDT with list'),
+      list: z.boolean().optional().describe('return the full symbol list for the quote'),
     }),
     run: async (a, d) => {
       if (!d.directory) throw new ToolError({ error: 'unavailable', message: 'Binance symbol directory is not available.' });
@@ -158,22 +188,34 @@ export const TOOLS = [
         throw new ToolError({ error: 'unavailable', message: `Cannot reach Binance exchangeInfo: ${(e as Error).message}` });
       }
       const subscribed = new Set(d.runtime.symbols().map((s) => s.symbol));
-      const inQuote = a.quote === 'ALL' ? all : all.filter((s) => s.quote === a.quote);
-      const hits = a.query ? inQuote.filter((s) => s.base === a.query || s.symbol.includes(a.query!)) : [];
-      // 精确匹配 base 的排前面
-      hits.sort((x, y) => Number(y.base === a.query) - Number(x.base === a.query) || x.symbol.localeCompare(y.symbol));
+      const quote = a.quote ?? (a.query ? 'ALL' : 'USDT');
+      const inQuote = quote === 'ALL' ? all : all.filter((s) => s.quote === quote);
       const quotes = new Map<string, number>();
       for (const s of all) quotes.set(s.quote, (quotes.get(s.quote) ?? 0) + 1);
-      return {
+      const out: Record<string, unknown> = {
         total_trading_spot: all.length,
-        top_quotes: [...quotes].sort((x, y) => y[1] - x[1]).slice(0, 6).map(([quote, count]) => ({ quote, count })),
-        quote_filter: a.quote,
+        top_quotes: [...quotes].sort((x, y) => y[1] - x[1]).slice(0, 6).map(([q, count]) => ({ quote: q, count })),
+        quote_filter: quote,
         in_quote: inQuote.length,
-        ...(a.query
-          ? { query: a.query, match_count: hits.length, matches: hits.slice(0, 30).map((s) => ({ symbol: s.symbol, subscribed: subscribed.has(s.symbol) })) }
-          : {}),
         subscribed: [...subscribed],
+        full_list_ui: 'Data Sources page → "All Binance Spot pairs" (searchable)',
       };
+      if (a.query) {
+        const q = a.query;
+        const hits = inQuote.filter((s) => s.base === q || s.symbol.includes(q));
+        // 精确匹配 base 的排前面
+        hits.sort((x, y) => Number(y.base === q) - Number(x.base === q) || x.symbol.localeCompare(y.symbol));
+        Object.assign(out, {
+          query: q,
+          match_count: hits.length,
+          matches: hits.slice(0, 50).map((s) => ({ symbol: s.symbol, subscribed: subscribed.has(s.symbol) })),
+        });
+        // 无命中时给近似 base（编辑距离 / 前缀），避免只回一句"0 匹配"
+        if (!hits.length) out.similar = similarBases(q, all.map((s) => s.base));
+      } else if (a.list) {
+        out.symbols = inQuote.map((s) => s.symbol).sort();
+      }
+      return out;
     },
   }),
 

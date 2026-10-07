@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { StreamStats } from '../lib.ts';
 import { api, fmtAgo, useLive, useNow } from '../lib.ts';
 
@@ -78,6 +78,57 @@ export function DataSourcesPage() {
         </div>
         );
       })}
+      <AllSymbols />
+    </div>
+  );
+}
+
+interface SpotSymbolRow { symbol: string; base: string; quote: string; subscribed: boolean }
+
+/** 全部可监控交易对（exchangeInfo TRADING）：可搜索、按计价币筛选，任何一个都能建 Signal */
+function AllSymbols() {
+  const [rows, setRows] = useState<SpotSymbolRow[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [q, setQ] = useState('');
+  const [quote, setQuote] = useState('USDT');
+  useEffect(() => {
+    api<{ symbols: SpotSymbolRow[] }>('/binance/symbols')
+      .then((r) => setRows(r.symbols.sort((a, b) => a.symbol.localeCompare(b.symbol))))
+      .catch((e) => setErr((e as Error).message));
+  }, []);
+  const quotes = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const r of rows ?? []) m.set(r.quote, (m.get(r.quote) ?? 0) + 1);
+    return [...m].sort((a, b) => b[1] - a[1]);
+  }, [rows]);
+  const query = q.trim().toUpperCase();
+  const shown = (rows ?? []).filter((r) => (quote === 'ALL' || r.quote === quote) && (!query || r.symbol.includes(query)));
+
+  return (
+    <div className="card">
+      <div className="page-head">
+        <h2>All Binance Spot pairs</h2>
+        <span className="muted small">{rows ? `${shown.length} / ${rows.length}` : err ? '' : '加载中…'}</span>
+      </div>
+      <p className="muted small">当前可交易（TRADING）的全部现货交易对，任意一个都可建 Signal（建好后自动订阅）。● 为已订阅。</p>
+      {err && <p className="bad-text small">{err}</p>}
+      {rows && (
+        <>
+          <div className="row">
+            <input placeholder="搜索，如 PEPE / AI / USDC" value={q} onChange={(e) => setQ(e.target.value)} />
+            <select value={quote} onChange={(e) => setQuote(e.target.value)}>
+              <option value="ALL">全部计价币 ({rows.length})</option>
+              {quotes.map(([k, n]) => <option key={k} value={k}>{k} ({n})</option>)}
+            </select>
+          </div>
+          <div className="symbol-grid mono small">
+            {shown.map((r) => (
+              <span key={r.symbol} className={r.subscribed ? 'ok-text' : undefined}>{r.subscribed ? '● ' : ''}{r.symbol}</span>
+            ))}
+            {!shown.length && <span className="muted">无匹配</span>}
+          </div>
+        </>
+      )}
     </div>
   );
 }
