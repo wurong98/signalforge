@@ -20,7 +20,9 @@ const runtime = new Runtime(db, hub, dispatcher, config.symbols, config.metricRe
 
 const build = { ...readBuildInfo(), started_at: Date.now() };
 
-const app = Fastify({ logger: { level: 'warn' } });
+// forceCloseConnections：关闭时断开所有连接。/api/live 是永不结束的 SSE 长连接，
+// 默认只断空闲连接，app.close() 会一直等它而卡住，Ctrl+C 停不下来
+const app = Fastify({ logger: { level: 'warn' }, forceCloseConnections: true });
 const auth = new Auth(config.adminFile);
 // 必须先于业务路由注册：onRequest 钩子拦截所有未鉴权的 /api 请求
 registerAuth(app, auth);
@@ -53,10 +55,38 @@ console.log(`  Binance: ${config.binanceWs}  symbols: ${config.symbols.join(',')
 console.log(`  NL parser: ${config.llm ? `LLM (${config.llm.model} @ ${config.llm.baseUrl})` : 'rules only (set LLM_BASE_URL / LLM_API_KEY)'}`);
 if (config.allowPrivateWebhooks) console.log('  WARNING: ALLOW_PRIVATE_WEBHOOKS=true — webhooks may target private networks');
 
+/**
+ * 停止顺序保证数据完整：
+ * 1. runtime.stop()：停止求值并把未落盘的指标点同步写入（同步执行，之后的强制退出也不会丢）；
+ * 2. app.close()：断开所有连接（含 SSE）；
+ * 3. db.close()：WAL 合并回主库后关闭。
+ * node:sqlite 的写入是同步事务，process.exit 只会发生在两次写入之间，不会打断事务；
+ * 强制退出路径同样先关库。
+ */
+let stopping = false;
+const closeDb = () => {
+  try {
+    db.close();
+  } catch (e) {
+    console.error('[db] close failed', e);
+  }
+};
+const forceExit = (why: string) => {
+  console.error(why);
+  closeDb();
+  process.exit(1);
+};
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, async () => {
+    // 第二次 Ctrl+C：不再等连接关闭，关库后立即退出
+    if (stopping) return forceExit('强制退出');
+    stopping = true;
+    console.log(`\n${sig}: 正在停止…（再按一次 Ctrl+C 强制退出）`);
+    // 兜底：关闭流程因任何原因卡住时 5 秒后强制退出
+    setTimeout(() => forceExit('停止超时，强制退出'), 5_000).unref();
     runtime.stop();
     await app.close();
+    closeDb();
     process.exit(0);
   });
 }

@@ -313,6 +313,15 @@ export class Db {
         .get(symbol, metric, from, to) as { ts: number; value: number } | undefined) ?? null;
     return { ...agg, first: pick('ts'), last: pick('ts DESC'), min_at: pick('value, ts'), max_at: pick('value DESC, ts') };
   }
+  /** 退出前调用：把 WAL 合并回主库再关闭；重复调用无害 */
+  close() {
+    if (!this.raw.isOpen) return;
+    try {
+      this.raw.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    } finally {
+      this.raw.close();
+    }
+  }
   pruneMetricPoints(before: number) {
     this.raw.prepare('DELETE FROM metric_points WHERE ts < ?').run(before);
   }
