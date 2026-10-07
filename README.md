@@ -41,7 +41,7 @@ npm run dev
 | `src/server/auth.ts` | 管理密码、会话 Cookie、登录限流；所有 `/api/*` 鉴权 |
 | `src/server/db.ts` | `node:sqlite`：webhooks / signals / events / deliveries / metric_points |
 | `src/server/binance/stream.ts` | Binance WS：每个交易对订阅 aggTrade + ticker，指数退避重连、假死检测、原始事件环形缓存 |
-| `src/server/binance/symbols.ts` | 币安现货交易对目录（REST exchangeInfo，缓存 1 小时），供助手回答"支持哪些交易对" |
+| `src/server/binance/symbols.ts` | 币安交易对目录：现货 + U 本位永续（含 TradFi 永续）exchangeInfo，缓存 1 小时，供助手与 Data Sources 页回答"支持哪些交易对" |
 | `src/server/engine/window.ts` | Window Engine：按成交时间 T 的增量滑动窗口，含预热/就绪判断 |
 | `src/server/engine/signal.ts` | 条件求值 + 状态机（WARMING / ARMED / COOLDOWN / ACTIVE） |
 | `src/server/engine/runtime.ts` | 编排：事件驱动求值 + 200ms tick、1s 采样、事件落库、Webhook 派发 |

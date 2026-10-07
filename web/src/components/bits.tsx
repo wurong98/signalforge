@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import type { MetricDef, SignalSpec } from '../../../src/shared/dsl.ts';
-import { describeCondition, describeFormula, metricUnit } from '../../../src/shared/dsl.ts';
+import { describeCondition, describeFormula, marketKey, metricUnit, productLabel } from '../../../src/shared/dsl.ts';
 import type { Delivery, EventRow, SignalState } from '../lib.ts';
 import { fmtDateTime, fmtNum, fmtTime } from '../lib.ts';
 
@@ -56,12 +56,12 @@ export function SpecView({ spec, values, action }: { spec: SignalSpec; values?: 
     <div className="spec-grid">
       <Section label="Source">
         <div className="mono">
-          Binance / Spot / <b>{spec.market.symbol}</b> / {streams.join(', ')}
+          Binance / {productLabel(spec.market.product)} / <b>{marketKey(spec.market)}</b> / {streams.join(', ')}
         </div>
       </Section>
       <Section label="Metrics">
         {spec.metrics.map((m) => (
-          <MetricLine key={m.name} m={m} all={spec.metrics} value={values?.[m.name]} symbol={spec.market.symbol} />
+          <MetricLine key={m.name} m={m} all={spec.metrics} value={values?.[m.name]} symbol={marketKey(spec.market)} />
         ))}
       </Section>
       <Section label="Condition">

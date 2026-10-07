@@ -125,13 +125,30 @@ export const isLeaf = (c: Condition): c is LeafCondition => 'left' in c;
 
 export const SYMBOL_RE = /^[A-Z0-9]{5,20}$/;
 
+/**
+ * 市场：spot = 币安现货；futures = 币安 U 本位永续合约（USDⓈ-M PERPETUAL）。
+ * 同名交易对（如 BTCUSDT）在两个市场是不同的行情，系统内部用"市场键"区分：
+ * 现货即 symbol，合约加 `.P` 后缀（与 TradingView 写法一致，如 BTCUSDT.P）。
+ * 窗口、指标历史、事件、助手工具都按市场键隔离。
+ */
+export const PRODUCTS = ['spot', 'futures'] as const;
+export type Product = (typeof PRODUCTS)[number];
+export const FUTURES_SUFFIX = '.P';
+export const MARKET_KEY_RE = /^[A-Z0-9]{5,20}(\.P)?$/;
+export const marketKey = (m: { product: Product; symbol: string }) => (m.product === 'futures' ? `${m.symbol}${FUTURES_SUFFIX}` : m.symbol);
+export function parseMarketKey(key: string): { product: Product; symbol: string } {
+  return key.endsWith(FUTURES_SUFFIX) ? { product: 'futures', symbol: key.slice(0, -FUTURES_SUFFIX.length) } : { product: 'spot', symbol: key };
+}
+export const productLabel = (p: Product) => (p === 'futures' ? 'USDⓈ-M Perpetual' : 'Spot');
+
 export const SignalSpecSchema = z.object({
   name: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/, 'slug：小写字母、数字、中划线'),
   title: z.string().min(1).max(80),
   description: z.string().max(500).default(''),
   market: z.object({
     exchange: z.literal('binance'),
-    product: z.literal('spot'),
+    // 已存库的 spec 都是 spot，新增 futures 向后兼容
+    product: z.enum(PRODUCTS),
     symbol: z.string().regex(SYMBOL_RE),
   }),
   metrics: z.array(MetricSchema).min(1).max(16),

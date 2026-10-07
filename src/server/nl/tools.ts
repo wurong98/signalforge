@@ -8,8 +8,8 @@
  */
 import { z } from 'zod';
 import { CATALOG, CATALOG_BY_NAME } from '../../shared/catalog.ts';
-import { SYMBOL_RE, describeCondition, describeFormula, metricUnit } from '../../shared/dsl.ts';
-import type { SymbolDirectory } from '../binance/symbols.ts';
+import { MARKET_KEY_RE, describeCondition, describeFormula, marketKey, metricUnit } from '../../shared/dsl.ts';
+import type { MarketSymbol } from '../binance/symbols.ts';
 import type { Db } from '../db.ts';
 import type { Runtime } from '../engine/runtime.ts';
 import type { LlmTool } from './llm.ts';
@@ -22,8 +22,8 @@ export interface ToolDeps {
   now: () => number;
   /** 用户时区（IANA），输出时间按它格式化 */
   tz: string;
-  /** 币安现货交易对目录（exchangeInfo）；未提供时 search_binance_symbols 报不可用 */
-  directory?: Pick<SymbolDirectory, 'list'>;
+  /** 币安交易对目录（现货 + U 本位永续 exchangeInfo）；未提供时 search_binance_symbols 报不可用 */
+  directory?: { list(): Promise<MarketSymbol[]>; errors?: Partial<Record<string, string>> };
 }
 
 const DAY = 86_400_000;
@@ -58,7 +58,7 @@ function present(name: string, v: number | null | undefined): { value: number | 
 
 // ---------- 参数 schema ----------
 
-const SymbolArg = z.string().trim().toUpperCase().regex(SYMBOL_RE).describe('Binance spot symbol, e.g. BTCUSDT');
+const SymbolArg = z.string().trim().toUpperCase().regex(MARKET_KEY_RE).describe('Market key: spot BTCUSDT, USDⓈ-M perpetual BTCUSDT.P');
 const MetricName = z.string().describe('Catalog metric name, e.g. buy_notional_10s, return_5m, ticker_change_pct_24h');
 const Range = {
   lookback_minutes: z.number().int().min(1).max(366 * 1440).optional().describe('Look back N minutes from now. Use this OR from/to.'),
@@ -170,14 +170,16 @@ export const TOOLS = [
   def({
     name: 'search_binance_symbols',
     description:
-      'Binance Spot pairs currently TRADING (from exchangeInfo) — i.e. what the user CAN monitor. Any of them can get a Signal; ' +
-      'creating a Signal subscribes it automatically, and only then do metrics exist. ' +
-      'With query: substring match on symbol/base across ALL quotes unless quote is given; no hit → "similar" suggestions. ' +
-      'With list=true: the full symbol list for the quote (default USDT; "ALL" for every pair) — use it when the user asks to see all pairs.',
+      'Binance pairs currently TRADING — what the user CAN monitor: Spot, and USDⓈ-M perpetual futures (incl. TradFi perpetuals ' +
+      'such as US stocks/ETFs, contract=TRADIFI_PERPETUAL). Binance writes spot and futures symbols the same (BTCUSDT); here ' +
+      'futures use the market key with ".P" (BTCUSDT.P). Any of them can get a Signal; creating one subscribes it, only then do metrics exist. ' +
+      'With query: substring match on symbol/base across ALL quotes and BOTH markets unless filtered; no hit → "similar" suggestions. ' +
+      'With list=true: the full list for the filters (default market spot, quote USDT) — use it when the user asks to see all pairs.',
     schema: z.object({
-      query: z.string().trim().toUpperCase().max(20).optional().describe('base asset or symbol fragment, e.g. XPL, PEPE'),
+      query: z.string().trim().toUpperCase().max(20).optional().describe('base asset or symbol fragment, e.g. XPL, PEPE, QQQ'),
       quote: z.string().trim().toUpperCase().max(10).optional().describe('quote asset filter, e.g. USDT; "ALL" for any. Default: ALL with query, USDT with list'),
-      list: z.boolean().optional().describe('return the full symbol list for the quote'),
+      market: z.enum(['spot', 'futures', 'all']).optional().describe('default: all with query, spot with list'),
+      list: z.boolean().optional().describe('return the full list for the filters'),
     }),
     run: async (a, d) => {
       if (!d.directory) throw new ToolError({ error: 'unavailable', message: 'Binance symbol directory is not available.' });
@@ -189,31 +191,34 @@ export const TOOLS = [
       }
       const subscribed = new Set(d.runtime.symbols().map((s) => s.symbol));
       const quote = a.quote ?? (a.query ? 'ALL' : 'USDT');
-      const inQuote = quote === 'ALL' ? all : all.filter((s) => s.quote === quote);
+      const market = a.market ?? (a.query ? 'all' : 'spot');
+      const inFilter = all.filter((s) => (quote === 'ALL' || s.quote === quote) && (market === 'all' || s.product === market));
+      const count = (p: string) => all.filter((s) => s.product === p).length;
       const quotes = new Map<string, number>();
-      for (const s of all) quotes.set(s.quote, (quotes.get(s.quote) ?? 0) + 1);
+      for (const s of all) if (s.product === 'spot') quotes.set(s.quote, (quotes.get(s.quote) ?? 0) + 1);
       const out: Record<string, unknown> = {
-        total_trading_spot: all.length,
-        top_quotes: [...quotes].sort((x, y) => y[1] - x[1]).slice(0, 6).map(([q, count]) => ({ quote: q, count })),
-        quote_filter: quote,
-        in_quote: inQuote.length,
+        total_trading_spot: count('spot'),
+        total_trading_futures_perpetual: count('futures'),
+        top_spot_quotes: [...quotes].sort((x, y) => y[1] - x[1]).slice(0, 6).map(([q, n]) => ({ quote: q, count: n })),
+        filters: { market, quote },
+        in_filter: inFilter.length,
         subscribed: [...subscribed],
-        full_list_ui: 'Data Sources page → "All Binance Spot pairs" (searchable)',
+        full_list_ui: 'Data Sources page → "All Binance pairs" (searchable, spot + futures)',
+        ...(d.directory.errors && Object.keys(d.directory.errors).length ? { unavailable_markets: d.directory.errors } : {}),
       };
+      const row = (s: MarketSymbol) => ({
+        symbol: s.key, market: s.product, ...(s.contract === 'TRADIFI_PERPETUAL' ? { tradfi: true } : {}), subscribed: subscribed.has(s.key),
+      });
       if (a.query) {
         const q = a.query;
-        const hits = inQuote.filter((s) => s.base === q || s.symbol.includes(q));
-        // 精确匹配 base 的排前面
-        hits.sort((x, y) => Number(y.base === q) - Number(x.base === q) || x.symbol.localeCompare(y.symbol));
-        Object.assign(out, {
-          query: q,
-          match_count: hits.length,
-          matches: hits.slice(0, 50).map((s) => ({ symbol: s.symbol, subscribed: subscribed.has(s.symbol) })),
-        });
+        const hits = inFilter.filter((s) => s.base === q || s.symbol.includes(q));
+        // 精确匹配 base 的排前面，同名时现货在前
+        hits.sort((x, y) => Number(y.base === q) - Number(x.base === q) || x.symbol.localeCompare(y.symbol) || x.key.localeCompare(y.key));
+        Object.assign(out, { query: q, match_count: hits.length, matches: hits.slice(0, 50).map(row) });
         // 无命中时给近似 base（编辑距离 / 前缀），避免只回一句"0 匹配"
         if (!hits.length) out.similar = similarBases(q, all.map((s) => s.base));
       } else if (a.list) {
-        out.symbols = inQuote.map((s) => s.symbol).sort();
+        out.symbols = inFilter.map((s) => s.key).sort();
       }
       return out;
     },
@@ -309,7 +314,7 @@ export const TOOLS = [
         return {
           id: s.id,
           title: s.spec.title,
-          symbol: s.spec.market.symbol,
+          symbol: marketKey(s.spec.market),
           enabled: s.enabled,
           state: st?.state ?? null,
           ready: st?.ready ?? false,
@@ -332,7 +337,7 @@ export const TOOLS = [
         id: s.id,
         title: s.spec.title,
         description: s.spec.description,
-        symbol: s.spec.market.symbol,
+        symbol: marketKey(s.spec.market),
         enabled: s.enabled,
         state: st?.state ?? null,
         ready: st?.ready ?? false,

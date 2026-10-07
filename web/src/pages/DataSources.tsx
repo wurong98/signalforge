@@ -36,20 +36,31 @@ export function DataSourcesPage() {
           <p className="muted small">系统实际订阅的 Binance 公共行情流。无需 API Key。</p>
         </div>
       </div>
-      <div className="card">
-        <div className="kv">
-          <span>Endpoint</span>
-          <code>{b?.url}/stream</code>
-          <span>Connection</span>
-          <span className={b?.status === 'connected' ? 'ok-text' : 'bad-text'}>● {b?.status ?? '—'}</span>
-          <span>Connected since</span>
-          <span>{b?.connected_since ? fmtAgo(b.connected_since, now + skew) : '—'}</span>
-          <span>Reconnects</span>
-          <span className="mono">{b?.reconnects ?? 0}</span>
-          <span>Last error</span>
-          <span className="small">{b?.last_error ?? '—'}</span>
-        </div>
-      </div>
+      {(b?.connections ?? (b ? [{ ...b, product: 'spot' as const }] : [])).map((c) => {
+        // 合约连接按需建立：没有合约 Signal 时不连接，显示为空闲而不是故障
+        const idle = !b?.streams.some((s) => s.symbol.endsWith('.P') === (c.product === 'futures'));
+        return (
+          <div key={c.product} className="card">
+            <h2>{c.product === 'futures' ? 'USDⓈ-M Perpetual' : 'Spot'}</h2>
+            <div className="kv">
+              <span>Endpoint</span>
+              <code>{c.url}/stream</code>
+              <span>Connection</span>
+              {idle ? (
+                <span className="muted">○ idle（{c.product === 'futures' ? '无合约 Signal，不连接' : '无订阅'}）</span>
+              ) : (
+                <span className={c.status === 'connected' ? 'ok-text' : 'bad-text'}>● {c.status}</span>
+              )}
+              <span>Connected since</span>
+              <span>{c.connected_since ? fmtAgo(c.connected_since, now + skew) : '—'}</span>
+              <span>Reconnects</span>
+              <span className="mono">{c.reconnects}</span>
+              <span>Last error</span>
+              <span className="small">{c.last_error ?? '—'}</span>
+            </div>
+          </div>
+        );
+      })}
       {b?.streams.map((s: StreamStats) => {
         const fields = s.stream === 'ticker' ? TICKER_FIELDS : AGGTRADE_FIELDS;
         const sample = samples[`${s.symbol}@${s.stream}`]?.[0];
@@ -83,47 +94,70 @@ export function DataSourcesPage() {
   );
 }
 
-interface SpotSymbolRow { symbol: string; base: string; quote: string; subscribed: boolean }
+interface MarketSymbolRow {
+  symbol: string; base: string; quote: string; product: 'spot' | 'futures'; key: string; contract?: string; subscribed: boolean;
+}
 
-/** 全部可监控交易对（exchangeInfo TRADING）：可搜索、按计价币筛选，任何一个都能建 Signal */
+const MARKETS = [
+  ['spot', '现货'],
+  ['futures', 'U 本位永续'],
+  ['all', '全部市场'],
+] as const;
+
+/** 全部可监控交易对（现货 + U 本位永续，exchangeInfo TRADING）：可搜索、按市场 / 计价币筛选，任何一个都能建 Signal */
 function AllSymbols() {
-  const [rows, setRows] = useState<SpotSymbolRow[] | null>(null);
+  const [rows, setRows] = useState<MarketSymbolRow[] | null>(null);
+  const [errs, setErrs] = useState<Record<string, string>>({});
   const [err, setErr] = useState<string | null>(null);
   const [q, setQ] = useState('');
+  const [market, setMarket] = useState<string>('spot');
   const [quote, setQuote] = useState('USDT');
   useEffect(() => {
-    api<{ symbols: SpotSymbolRow[] }>('/binance/symbols')
-      .then((r) => setRows(r.symbols.sort((a, b) => a.symbol.localeCompare(b.symbol))))
+    api<{ symbols: MarketSymbolRow[]; errors?: Record<string, string> }>('/binance/symbols')
+      .then((r) => {
+        setRows(r.symbols.sort((a, b) => a.key.localeCompare(b.key)));
+        setErrs(r.errors ?? {});
+      })
       .catch((e) => setErr((e as Error).message));
   }, []);
+  const inMarket = useMemo(() => (rows ?? []).filter((r) => market === 'all' || r.product === market), [rows, market]);
   const quotes = useMemo(() => {
     const m = new Map<string, number>();
-    for (const r of rows ?? []) m.set(r.quote, (m.get(r.quote) ?? 0) + 1);
+    for (const r of inMarket) m.set(r.quote, (m.get(r.quote) ?? 0) + 1);
     return [...m].sort((a, b) => b[1] - a[1]);
-  }, [rows]);
+  }, [inMarket]);
   const query = q.trim().toUpperCase();
-  const shown = (rows ?? []).filter((r) => (quote === 'ALL' || r.quote === quote) && (!query || r.symbol.includes(query)));
+  const shown = inMarket.filter((r) => (quote === 'ALL' || r.quote === quote) && (!query || r.key.includes(query)));
 
   return (
     <div className="card">
       <div className="page-head">
-        <h2>All Binance Spot pairs</h2>
+        <h2>All Binance pairs</h2>
         <span className="muted small">{rows ? `${shown.length} / ${rows.length}` : err ? '' : '加载中…'}</span>
       </div>
-      <p className="muted small">当前可交易（TRADING）的全部现货交易对，任意一个都可建 Signal（建好后自动订阅）。● 为已订阅。</p>
+      <p className="muted small">
+        当前可交易（TRADING）的全部现货与 U 本位永续合约（含美股等 TradFi 永续），任意一个都可建 Signal（建好后自动订阅）。
+        币安里现货与合约符号写法相同，这里合约加 <code>.P</code> 区分（同 TradingView）。● 为已订阅。
+      </p>
       {err && <p className="bad-text small">{err}</p>}
+      {Object.entries(errs).map(([k, v]) => <p key={k} className="bad-text small">{k === 'futures' ? '合约' : '现货'}列表获取失败：{v}</p>)}
       {rows && (
         <>
           <div className="row">
-            <input placeholder="搜索，如 PEPE / AI / USDC" value={q} onChange={(e) => setQ(e.target.value)} />
+            <input placeholder="搜索，如 PEPE / AI / QQQ" value={q} onChange={(e) => setQ(e.target.value)} />
+            <select value={market} onChange={(e) => setMarket(e.target.value)}>
+              {MARKETS.map(([k, label]) => <option key={k} value={k}>{label}</option>)}
+            </select>
             <select value={quote} onChange={(e) => setQuote(e.target.value)}>
-              <option value="ALL">全部计价币 ({rows.length})</option>
+              <option value="ALL">全部计价币 ({inMarket.length})</option>
               {quotes.map(([k, n]) => <option key={k} value={k}>{k} ({n})</option>)}
             </select>
           </div>
           <div className="symbol-grid mono small">
             {shown.map((r) => (
-              <span key={r.symbol} className={r.subscribed ? 'ok-text' : undefined}>{r.subscribed ? '● ' : ''}{r.symbol}</span>
+              <span key={r.key} className={r.subscribed ? 'ok-text' : undefined} title={r.contract === 'TRADIFI_PERPETUAL' ? 'TradFi 永续' : undefined}>
+                {r.subscribed ? '● ' : ''}{r.key}{r.contract === 'TRADIFI_PERPETUAL' ? ' ·TradFi' : ''}
+              </span>
             ))}
             {!shown.length && <span className="muted">无匹配</span>}
           </div>

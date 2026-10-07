@@ -5,8 +5,8 @@
  *   "BTC 创 24 小时新低时提醒我，每分钟最多一次"
  *   "XPL 5 分钟涨幅超过 2% 且 CVD 为正" / "XPL 5 分钟上涨但 CVD 为负"
  */
-import type { MetricDef, SignalSpec, WindowSpec } from '../../shared/dsl.ts';
-import { WINDOWS, windowMs } from '../../shared/dsl.ts';
+import type { MetricDef, Product, SignalSpec, WindowSpec } from '../../shared/dsl.ts';
+import { WINDOWS, marketKey, windowMs } from '../../shared/dsl.ts';
 
 export interface ParseOutput {
   spec: SignalSpec;
@@ -19,6 +19,10 @@ const KNOWN_BASES = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE', 'ADA', 'TRX', 'A
 
 /** "24 小时 / 24h / 一天 / 日内" 这类长周期说法 */
 const PERIOD_24H = /(24\s*(?:小时|小時|h\b|hours?\b|hr)|24h|一天|日内)/i;
+
+/** 合约（U 本位永续）说法；币安里现货和合约的符号写法相同，只能靠这些词区分 */
+const FUTURES_RE = /合约|永续|perp|futures?\b|\.P\b/i;
+export const detectProduct = (text: string): Product => (FUTURES_RE.test(text) ? 'futures' : 'spot');
 
 export function detectSymbol(text: string): { symbol: string; assumed: boolean } {
   const up = text.toUpperCase();
@@ -158,11 +162,14 @@ function parse24h(
 }
 
 export function parseWithRules(text: string): ParseOutput | { error: string } {
-  const { symbol, assumed: symAssumed } = detectSymbol(text);
-  const base = symbol.replace(/(USDT|USDC|FDUSD|BTC)$/, '').toLowerCase() || 'x';
+  const { symbol: raw, assumed: symAssumed } = detectSymbol(text);
+  const product = detectProduct(text);
+  const market = { exchange: 'binance' as const, product, symbol: raw };
+  // 后续说明文字里用市场键（合约 BTCUSDT.P），名称加 -perp，避免与同名现货 Signal 重名
+  const symbol = marketKey(market);
+  const base = (raw.replace(/(USDT|USDC|FDUSD|BTC)$/, '').toLowerCase() || 'x') + (product === 'futures' ? '-perp' : '');
   const assumptions: string[] = [];
-  if (symAssumed) assumptions.push('未识别到交易对，默认 BTCUSDT');
-  const market = { exchange: 'binance' as const, product: 'spot' as const, symbol };
+  if (symAssumed) assumptions.push(`未识别到交易对，默认 ${symbol}`);
   const cooldown = detectCooldown(text) ?? 10_000;
 
   // 24h 档先于窗口分支判断：否则"24 小时新低"会被降级成短窗口近似，语义完全不同

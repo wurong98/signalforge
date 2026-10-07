@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { SignalSpec } from '../../../src/shared/dsl.ts';
+import { marketKey } from '../../../src/shared/dsl.ts';
 import { Section, SpecView } from '../components/bits.tsx';
 import type { LeafResult } from '../lib.ts';
 import { ApiError, api, fmtNum, useLive } from '../lib.ts';
@@ -218,7 +219,7 @@ export function CreatePage() {
           {preview && (
             <Section label="Preview · live">
               {!preview.subscribed ? (
-                <div className="muted small">{parsed.spec.market.symbol} 尚未订阅，创建后开始接收数据。</div>
+                <div className="muted small">{marketKey(parsed.spec.market)} 尚未订阅，创建后开始接收数据。</div>
               ) : !preview.ready ? (
                 <div className="muted small">窗口预热中…</div>
               ) : (

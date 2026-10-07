@@ -13,10 +13,10 @@ import { parseWithRules } from './rules.ts';
 
 const MAX_WINDOW = WINDOWS[WINDOWS.length - 1];
 
-const SYSTEM_PROMPT = `You convert a user's natural-language market-monitoring request into a Signal DSL JSON for Binance Spot real-time data.
+const SYSTEM_PROMPT = `You convert a user's natural-language market-monitoring request into a Signal DSL JSON for Binance real-time data (Spot or USDⓈ-M perpetual futures).
 You NEVER decide at runtime whether a signal fires; you only produce a structured definition.
 
-Available data — two Binance Spot public streams:
+Available data — two Binance public streams (identical fields on Spot and USDⓈ-M perpetual futures):
 1. "aggTrade" (window metrics, max ${MAX_WINDOW}): p=price, q=quantity, T=trade time, m=buyer_is_maker.
    - Aggressive BUY (taker buy) = buyer_is_maker:false. Aggressive SELL (taker sell) = buyer_is_maker:true.
    - "notional" = price × quantity (in quote currency, e.g. USDT).
@@ -29,7 +29,10 @@ type Spec = {
   name: string;            // slug: ^[a-z0-9][a-z0-9-]{0,63}$, e.g. "btc-buy-pressure-10s"
   title: string;           // short human title, English, e.g. "BTC Buy Pressure 10s"
   description: string;     // the user's intent, 1 sentence
-  market: { exchange: "binance"; product: "spot"; symbol: string }; // e.g. "BTCUSDT"
+  market: { exchange: "binance"; product: "spot" | "futures"; symbol: string }; // e.g. "BTCUSDT"
+  // product: "futures" = USDⓈ-M perpetual (incl. TradFi perpetuals for US stocks/ETFs). Use it ONLY when the user says
+  // 合约 / 永续 / perp / futures or writes a ".P" symbol; otherwise "spot". symbol is the plain Binance symbol in both
+  // markets (never add ".P" / "_PERP" to it) — Binance writes spot and futures BTCUSDT the same.
   metrics: Metric[];       // 1..16; a combine metric may only reference metrics defined BEFORE it
   condition: Condition;
   cooldown_ms: number;     // default 10000 unless the user says otherwise

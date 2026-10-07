@@ -2,12 +2,15 @@
  * Runtime Engine（PRD §20）：
  *   Binance Event → Metric Update → Signal Evaluation → Event → Webhook
  * 完全确定性，不经过 LLM。
+ *
+ * 内部所有按交易对组织的状态（窗口、时钟、序列、事件 symbol）都以市场键为键：
+ * 现货 BTCUSDT 与合约 BTCUSDT.P 是两套互不相干的行情。
  */
 import { EventEmitter } from 'node:events';
 import { CATALOG } from '../../shared/catalog.ts';
 import type { SignalSpec } from '../../shared/dsl.ts';
-import { describeCondition } from '../../shared/dsl.ts';
-import type { BinanceHub } from '../binance/stream.ts';
+import { describeCondition, marketKey } from '../../shared/dsl.ts';
+import type { MarketHub } from '../binance/stream.ts';
 import type { Db, EventRow, SignalRow } from '../db.ts';
 import type { WebhookDispatcher } from '../webhook/delivery.ts';
 import type { EvalResult, SignalState } from './signal.ts';
@@ -89,7 +92,7 @@ export class Runtime extends EventEmitter {
 
   constructor(
     private db: Db,
-    private hub: BinanceHub,
+    private hub: Pick<MarketHub, 'on' | 'start' | 'stop' | 'ensure' | 'release'>,
     private dispatcher: WebhookDispatcher,
     private baseSymbols: string[],
     private retentionDays: number,
@@ -104,8 +107,9 @@ export class Runtime extends EventEmitter {
         c.awaitingFirst = true;
       }
     });
-    hub.on('disconnected', () => {
-      for (const w of this.windows.values()) w.markDisconnected();
+    // 只作废断线那条连接上的市场；另一市场的连接仍在，窗口照常连续
+    hub.on('disconnected', (_reason, symbols) => {
+      for (const s of symbols) this.windows.get(s)?.markDisconnected();
       this.evaluateAll();
     });
   }
@@ -152,7 +156,7 @@ export class Runtime extends EventEmitter {
 
   private symbolsInUse() {
     const s = new Set(this.baseSymbols);
-    for (const r of this.runners.values()) s.add(r.row.spec.market.symbol);
+    for (const r of this.runners.values()) s.add(marketKey(r.row.spec.market));
     return s;
   }
 
@@ -225,7 +229,7 @@ export class Runtime extends EventEmitter {
     const w = this.windows.get(symbol);
     if (!w) return;
     for (const r of this.runners.values()) {
-      if (r.row.spec.market.symbol !== symbol) continue;
+      if (marketKey(r.row.spec.market) !== symbol) continue;
       try {
         const now = w.now;
         r.values = w.evaluate(r.row.spec.metrics);
@@ -251,7 +255,7 @@ export class Runtime extends EventEmitter {
       signal_version: r.row.version,
       ts,
       local_ts: Date.now(),
-      symbol: spec.market.symbol,
+      symbol: marketKey(spec.market),
       snapshot: { ...r.values },
       condition: r.result,
       spec,
@@ -271,13 +275,14 @@ export class Runtime extends EventEmitter {
       title: spec.title,
       exchange: spec.market.exchange,
       market: spec.market.product,
+      // 交易所原始符号（下游可直接用于币安 API）；现货/合约看 market 字段
       symbol: spec.market.symbol,
       timestamp: ts,
       condition: describeCondition(spec.condition),
       metrics,
     };
     this.dispatcher
-      .deliver(webhook, payload, id, false, { spec, values: r.values, ticker: this.windows.get(spec.market.symbol)?.ticker24h })
+      .deliver(webhook, payload, id, false, { spec, values: r.values, ticker: this.windows.get(marketKey(spec.market))?.ticker24h })
       .then((res) => this.db.setEventDelivery(id, res.ok ? 'success' : 'failed'))
       .catch((e) => {
         console.error('[webhook] dispatcher crashed', e);
@@ -295,7 +300,7 @@ export class Runtime extends EventEmitter {
     }
     for (const r of this.runners.values()) {
       if (!r.result) continue;
-      this.record(r.row.spec.market.symbol, `signal:${r.row.id}`, ts, r.ready ? gauge(r.result).value : null);
+      this.record(marketKey(r.row.spec.market), `signal:${r.row.id}`, ts, r.ready ? gauge(r.result).value : null);
     }
   }
 
@@ -346,7 +351,7 @@ export class Runtime extends EventEmitter {
 
   /** Create 页 Preview：用实时窗口对未保存的规格求值一次（不触发、不落库） */
   preview(spec: SignalSpec) {
-    const w = this.windows.get(spec.market.symbol);
+    const w = this.windows.get(marketKey(spec.market));
     if (!w) return { subscribed: false, ready: false, values: {}, result: null };
     const values = w.evaluate(spec.metrics);
     const ready = w.ready(requiredWindowMs(spec)) && (!requiresTicker(spec) || w.ticker24h !== null);
@@ -359,14 +364,14 @@ export class Runtime extends EventEmitter {
       const row = this.db.getSignal(id);
       if (!row) return null;
       return {
-        id, name: row.spec.name, symbol: row.spec.market.symbol, enabled: row.enabled, state: 'DISABLED', ready: false,
+        id, name: row.spec.name, symbol: marketKey(row.spec.market), enabled: row.enabled, state: 'DISABLED', ready: false,
         last_eval_local: null, last_event_ts: this.db.lastEventTs(id), values: {}, gauge: { value: null, threshold: null, kind: 'value' }, error: null,
       };
     }
     return {
       id,
       name: r.row.spec.name,
-      symbol: r.row.spec.market.symbol,
+      symbol: marketKey(r.row.spec.market),
       enabled: true,
       state: r.sm.state,
       ready: r.ready,

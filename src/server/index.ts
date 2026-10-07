@@ -6,7 +6,7 @@ import Fastify from 'fastify';
 import { formatBuild } from '../shared/build.ts';
 import { registerApi } from './api.ts';
 import { Auth, registerAuth } from './auth.ts';
-import { BinanceHub } from './binance/stream.ts';
+import { MarketHub } from './binance/stream.ts';
 import { config } from './config.ts';
 import { Db } from './db.ts';
 import { Runtime } from './engine/runtime.ts';
@@ -14,7 +14,7 @@ import { readBuildInfo } from './version.ts';
 import { WebhookDispatcher } from './webhook/delivery.ts';
 
 const db = new Db(config.dbPath);
-const hub = new BinanceHub(config.binanceWs);
+const hub = new MarketHub(config.binanceWs, config.binanceFuturesWs);
 const dispatcher = new WebhookDispatcher(db, config.allowPrivateWebhooks);
 const runtime = new Runtime(db, hub, dispatcher, config.symbols, config.metricRetentionDays);
 
@@ -51,7 +51,7 @@ console.log(
     ? `  Admin password: set (${config.adminFile}；忘记密码删除该文件即可重设)`
     : '  WARNING: 尚未设置管理密码——第一个打开页面的人将设置它，请尽快完成设置',
 );
-console.log(`  Binance: ${config.binanceWs}  symbols: ${config.symbols.join(',')}`);
+console.log(`  Binance: spot ${config.binanceWs} · futures ${config.binanceFuturesWs}  symbols: ${config.symbols.join(',')}`);
 console.log(`  NL parser: ${config.llm ? `LLM (${config.llm.model} @ ${config.llm.baseUrl})` : 'rules only (set LLM_BASE_URL / LLM_API_KEY)'}`);
 if (config.allowPrivateWebhooks) console.log('  WARNING: ALLOW_PRIVATE_WEBHOOKS=true — webhooks may target private networks');
 

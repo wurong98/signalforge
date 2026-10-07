@@ -23,6 +23,8 @@ export interface FeishuSource {
   event_id?: number;
   signal?: string;
   title?: string;
+  /** spot / futures（U 本位永续）；同名交易对两个市场行情不同，卡片上要标出来 */
+  market?: string;
   symbol?: string;
   timestamp?: number;
   condition?: string;
@@ -57,7 +59,9 @@ const fmtChange = (f: number) => `${f >= 0 ? '📈' : '📉'} ${fmtPct(f)}`;
 // 服务端时区不可控，统一按北京时间展示并注明
 const fmtTime = (ms: number) => new Date(ms).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
 
+const symbolOf = (p: FeishuSource) => (p.symbol ? `${p.symbol}${p.market === 'futures' ? ' 永续' : ''}` : '—');
 const baseOf = (symbol: string) => symbol.replace(/(USDT|USDC|FDUSD|BTC)$/, '') || symbol;
+const titleOf = (p: FeishuSource) => `${baseOf(p.symbol ?? '—')}${p.market === 'futures' ? ' 永续' : ''}`;
 
 const field = (label: string, value: string) => ({ is_short: true, text: { tag: 'lark_md', content: `**${label}**\n${value}` } });
 const md = (content: string) => ({ tag: 'div', text: { tag: 'lark_md', content } });
@@ -114,7 +118,7 @@ function footer(p: FeishuSource, ticker: Ticker | null | undefined, ms: number) 
 
 function extremeCard(p: FeishuSource, hit: ExtremeHit, t: Ticker | null | undefined, ms: number) {
   const low = hit.direction === 'low';
-  const symbol = p.symbol ?? '—';
+  const symbol = symbolOf(p);
   const fields = [
     field('交易对', `**${symbol}**`),
     field(low ? '新低价格' : '新高价格', `**${fmtNum(hit.price)}**`),
@@ -126,7 +130,7 @@ function extremeCard(p: FeishuSource, hit: ExtremeHit, t: Ticker | null | undefi
       low ? field('24h 高', `**${fmtNum(t.high)}**`) : field('24h 低', `**${fmtNum(t.low)}**`),
     );
   }
-  return card(`${low ? '📉' : '📈'} ${baseOf(symbol)} 24h ${low ? '新低' : '新高'}告警`, low ? 'green' : 'red', [
+  return card(`${low ? '📉' : '📈'} ${titleOf(p)} 24h ${low ? '新低' : '新高'}告警`, low ? 'green' : 'red', [
     md(low ? '**帅哥，快来抄底呀~** 🚀' : '**嘿，破新高了~** ⚡'),
     HR,
     { tag: 'div', fields },
@@ -138,7 +142,7 @@ function extremeCard(p: FeishuSource, hit: ExtremeHit, t: Ticker | null | undefi
 function genericCard(p: FeishuSource, t: Ticker | null | undefined, ms: number) {
   const metrics = Object.entries(p.metrics ?? {}).map(([k, v]) => field(k, fmtNum(v)));
   return card(`🔔 ${p.title ?? p.signal ?? 'Signal'} 触发`, 'orange', [
-    { tag: 'div', fields: [field('交易对', `**${p.symbol ?? '—'}**`), field('Signal', p.signal ?? '—')] },
+    { tag: 'div', fields: [field('交易对', `**${symbolOf(p)}**`), field('Signal', p.signal ?? '—')] },
     ...(p.condition ? [md(`**条件**\n${p.condition}`)] : []),
     ...(metrics.length ? [HR, md('**触发时指标**'), { tag: 'div', fields: metrics }] : []),
     HR,
@@ -148,11 +152,11 @@ function genericCard(p: FeishuSource, t: Ticker | null | undefined, ms: number) 
 
 /** 测试：有真实 ticker 就发状态快照（与 bnb_extremes.py --test-feishu 一致，不用假数据） */
 function testCard(p: FeishuSource, t: Ticker | null | undefined, ms: number) {
-  const symbol = p.symbol ?? '—';
+  const symbol = symbolOf(p);
   if (!t) {
     return card('📊 SignalForge 测试消息', 'blue', [md('**连通性测试**：频道可正常接收 SignalForge 卡片（暂无行情快照）'), HR, footer(p, null, ms)]);
   }
-  return card(`📊 ${baseOf(symbol)} 24h 状态快照`, 'blue', [
+  return card(`📊 ${titleOf(p)} 24h 状态快照`, 'blue', [
     md('**SignalForge 测试消息**：频道连通，以下为当前真实行情（非告警）'),
     HR,
     {

@@ -2,9 +2,10 @@ import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import type { ServerBuild } from '../shared/build.ts';
 import { CATALOG, CATALOG_BY_NAME, catalogDescription } from '../shared/catalog.ts';
-import { SYMBOL_RE, WebhookInputSchema, describeFormula, metricUnit, validateSpec } from '../shared/dsl.ts';
-import type { BinanceHub } from './binance/stream.ts';
-import { SymbolDirectory } from './binance/symbols.ts';
+import type { Product } from '../shared/dsl.ts';
+import { SYMBOL_RE, WebhookInputSchema, describeFormula, marketKey, metricUnit, parseMarketKey, validateSpec } from '../shared/dsl.ts';
+import type { MarketHub } from './binance/stream.ts';
+import { MarketDirectory } from './binance/symbols.ts';
 import { config } from './config.ts';
 import type { Db } from './db.ts';
 import type { Runtime } from './engine/runtime.ts';
@@ -20,20 +21,29 @@ function bad(reply: FastifyReply, errors: string[] | string, code = 400) {
   return reply.code(code).send({ errors: Array.isArray(errors) ? errors : [errors] });
 }
 
-/** 通过 Binance REST 确认交易对存在（PRD §25 Subscription failure 的前置防线） */
-async function checkSymbol(symbol: string): Promise<string | null> {
+/**
+ * 通过 Binance REST 确认交易对存在（PRD §25 Subscription failure 的前置防线）。
+ * 合约用目录（只含 TRADING 的永续）判断：fapi exchangeInfo 不能按 symbol 精确查询。
+ */
+async function checkSymbol(market: { product: Product; symbol: string }, directory: MarketDirectory): Promise<string | null> {
+  const { product, symbol } = market;
   try {
+    if (product === 'futures') {
+      const list = await directory.dirs.find((d) => d.product === 'futures')!.list();
+      return list.some((s) => s.symbol === symbol) ? null : `Binance U 本位永续合约不存在（或未在交易）${symbol}`;
+    }
     const res = await fetch(`${config.binanceRest}/api/v3/exchangeInfo?symbol=${symbol}`, { signal: AbortSignal.timeout(5_000) });
-    if (res.status === 400) return `Binance 不存在交易对 ${symbol}`;
+    if (res.status === 400) return `Binance 现货不存在交易对 ${symbol}`;
     return null;
   } catch {
     return null; // REST 不可达时不阻塞创建；WS 订阅失败会在 Data Sources 中可见
   }
 }
 
-export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runtime; hub: BinanceHub; dispatcher: WebhookDispatcher; build: ServerBuild }) {
+export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runtime; hub: MarketHub; dispatcher: WebhookDispatcher; build: ServerBuild }) {
   const { db, runtime, hub, dispatcher } = deps;
   const idParam = (req: any) => Number(req.params.id);
+  const directory = new MarketDirectory(config.binanceRest, config.binanceFuturesRest);
 
   // ---------- 系统状态 / 实时推送 ----------
   const statusPayload = () => {
@@ -87,7 +97,6 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
   });
   // 每次对话最多 7 次 LLM 调用，限制并发避免把额度打满
   let chatInFlight = 0;
-  const directory = new SymbolDirectory(config.binanceRest);
   app.post('/api/chat', async (req, reply) => {
     if (!config.llm) return bad(reply, '未配置 LLM（LLM_BASE_URL / LLM_API_KEY），助手不可用；创建 Signal 请用 Create 页（规则解析）', 503);
     const body = ChatBody.safeParse(req.body);
@@ -131,7 +140,7 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
     if (!v.ok) return bad(reply, v.errors), null;
     if (!SYMBOL_RE.test(v.spec.market.symbol)) return bad(reply, 'invalid symbol'), null;
     if (db.signalNameTaken(v.spec.name, exceptId)) return bad(reply, `Signal 名称 ${v.spec.name} 已存在`), null;
-    const symErr = await checkSymbol(v.spec.market.symbol);
+    const symErr = await checkSymbol(v.spec.market, directory);
     if (symErr) return bad(reply, symErr), null;
     let webhookId = b.data.webhook_id ?? null;
     if (b.data.webhook) webhookId = db.insertWebhook(b.data.webhook);
@@ -205,7 +214,7 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
     const s = db.getSignal(idParam(req));
     if (!s) return bad(reply, 'not found', 404);
     const range = RANGES[(req.query as any).range] ?? RANGES['15m'];
-    return { points: runtime.seriesFor(s.spec.market.symbol, `signal:${s.id}`, range) };
+    return { points: runtime.seriesFor(marketKey(s.spec.market), `signal:${s.id}`, range) };
   });
 
   // ---------- Events ----------
@@ -265,12 +274,13 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
     if (!w) return bad(reply, 'not found', 404);
     // 飞书测试卡片用真实行情快照；通用 Webhook 的测试报文不变
     const live = runtime.latestTicker();
+    const m = parseMarketKey(live?.symbol ?? 'BTCUSDT');
     const payload = {
       event: 'signal.test',
       signal: 'test',
       exchange: 'binance',
-      market: 'spot',
-      symbol: live?.symbol ?? 'BTCUSDT',
+      market: m.product,
+      symbol: m.symbol,
       timestamp: Date.now(),
       metrics: { buy_notional_10s: 9213481.21, sell_notional_10s: 2821731.82, ratio: 3.26 },
     };
@@ -299,12 +309,12 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
   });
 
   // ---------- Data Sources ----------
-  // 全部可监控交易对（exchangeInfo TRADING），供 Data Sources 页自行搜索浏览
+  // 全部可监控交易对（现货 + U 本位永续，exchangeInfo TRADING），供 Data Sources 页自行搜索浏览
   app.get('/api/binance/symbols', async (_req, reply) => {
     try {
       const subscribed = new Set(runtime.symbols().map((s) => s.symbol));
       const list = await directory.list();
-      return { symbols: list.map((s) => ({ ...s, subscribed: subscribed.has(s.symbol) })) };
+      return { symbols: list.map((s) => ({ ...s, subscribed: subscribed.has(s.key) })), errors: directory.errors };
     } catch (e) {
       return bad(reply, `无法获取 Binance 交易对列表：${(e as Error).message}`, 502);
     }
