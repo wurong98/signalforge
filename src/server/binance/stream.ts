@@ -11,10 +11,11 @@
  * 对外一律使用"市场键"（现货 BTCUSDT，合约 BTCUSDT.P，见 dsl.ts marketKey）。
  * 合约 aggTrade / 24hrTicker 报文字段是现货的子集，解析逻辑通用。
  *
- * 合约连接另订阅全局流 `tradingSession`（/market 路由，每秒每个市场一条）：TradFi 永续
- * （美股 / A 股 / 港股 / 韩股 / 商品 / 外汇）休市时没有成交，aggTrade 与 ticker 都不推送。
- * 若连接上只有这类合约，休市期间会 30s 无消息被假死检测反复重连，每次重连都作废窗口，
- * 午休（A 股 11:30–13:00）后还要重新预热。tradingSession 不停推送，顺带记录各市场当前时段。
+ * 合约连接另订阅全局流 `tradingSession`（/market 路由，每秒每个市场一条，标的休市也推）作保活：
+ * 冷门合约（如节假日的 TradFi 永续）成交可能间隔 30s 以上，ticker 也只在有变化时推送，
+ * 若连接上只有这类合约，会被假死检测判死、反复重连，每次重连都作废窗口，永远攒不满预热。
+ * 顺带记录各 TradFi 标的市场的当前时段（仅供展示）：NO_TRADING 指标的休市，
+ * 合约本身 7×24 照常交易（标的休市时指数价格固定在最后已知值），不能据此判断"无成交"。
  * 报文：{e:"CN_EquityUpdate",E,t:时段开始,T:时段结束,S:"REGULAR"|"NO_TRADING"|...}，
  * e 去掉 Update 后转大写即市场名（CN_EQUITY），与 exchangeInfo 的 underlyingType 一致。
  */
@@ -77,6 +78,10 @@ interface StreamState {
 export declare interface BinanceHub {
   on(ev: 'trade', fn: (symbol: string, t: Trade, eventTime: number, recvLocal: number) => void): this;
   on(ev: 'ticker', fn: (symbol: string, t: Ticker, eventTime: number, recvLocal: number) => void): this;
+  /**
+   * 这些市场键的流从本地时间 at 起已生效：连接建立（URL 自带的流）或 SUBSCRIBE 得到确认。
+   * 此后连接不断，没收到成交就是确实没有成交，窗口从这一刻起算预热。
+   */
   on(ev: 'connected', fn: (symbols: string[], at: number) => void): this;
   /** symbols：这条连接上受影响的市场键（只作废这些窗口，另一市场不受影响） */
   on(ev: 'disconnected', fn: (reason: string, symbols: string[]) => void): this;
@@ -119,6 +124,8 @@ export class BinanceHub extends EventEmitter {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private stopped = false;
   private sessions = new Map<string, MarketSession>();
+  /** 未确认的 SUBSCRIBE：请求 id → 市场键 */
+  private pendingSubs = new Map<number, string[]>();
 
   /** 交易所报文里的 symbol → 市场键 */
   private readonly suffix: string;
@@ -174,11 +181,19 @@ export class BinanceHub extends EventEmitter {
     this.symbols.add(symbol);
     this.addState(symbol);
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ method: 'SUBSCRIBE', params: this.keysOf(symbol), id: this.reqId++ }));
+      this.subscribe([symbol]);
     } else if (this.started && !this.ws && !this.reconnectTimer) {
-      // 空闲（无订阅未连接）时按需建立连接；连接中 / 等待重连时由 connect() 带上全部流
+      // 空闲（无订阅未连接）时按需建立连接；等待重连时由 connect() 带上全部流，
+      // 连接中（URL 已拼好）时由 onopen 补发 SUBSCRIBE
       this.connect();
     }
+  }
+
+  /** 生效以确认回执为准（onMessage 里发 connected），不能以发出请求为准 */
+  private subscribe(symbols: string[]) {
+    const id = this.reqId++;
+    this.pendingSubs.set(id, symbols);
+    this.ws!.send(JSON.stringify({ method: 'SUBSCRIBE', params: symbols.flatMap((s) => this.keysOf(s)), id }));
   }
 
   release(symbol: string) {
@@ -206,7 +221,8 @@ export class BinanceHub extends EventEmitter {
   private connect() {
     this.reconnectTimer = null;
     if (this.stopped || !this.symbols.size) return;
-    const streams = [...this.symbols].flatMap((s) => this.keysOf(s));
+    const live = [...this.symbols];
+    const streams = live.flatMap((s) => this.keysOf(s));
     if (this.product === 'futures') streams.push(SESSION_STREAM);
     const url = `${this.baseUrl}/stream?streams=${streams.join('/')}`;
     this.status = 'connecting';
@@ -225,7 +241,11 @@ export class BinanceHub extends EventEmitter {
       this.lastMessageLocal = Date.now();
       this.backoffMs = 1000;
       for (const s of this.streams.values()) s.stats.status = 'connected';
-      this.emit('connected', [...this.symbols], Date.now());
+      // 只有 URL 里的流此刻生效；连接中途 ensure() 加进来的交易对不在 URL 里，要补订阅
+      const inUrl = live.filter((s) => this.symbols.has(s));
+      if (inUrl.length) this.emit('connected', inUrl, Date.now());
+      const late = [...this.symbols].filter((s) => !live.includes(s));
+      if (late.length) this.subscribe(late);
     };
     ws.onmessage = (ev) => this.onMessage(String(ev.data));
     ws.onerror = (ev: any) => {
@@ -238,6 +258,7 @@ export class BinanceHub extends EventEmitter {
 
   private onClose(reason: string) {
     this.ws = null;
+    this.pendingSubs.clear();
     this.status = 'disconnected';
     this.connectedSince = null;
     this.lastError = reason;
@@ -283,9 +304,15 @@ export class BinanceHub extends EventEmitter {
     }
     // 订阅请求响应：{"result":null,"id":1} 或错误
     if ('id' in msg && !('stream' in msg)) {
+      const syms = this.pendingSubs.get(msg.id);
+      this.pendingSubs.delete(msg.id);
       if (msg.error) {
         this.lastError = `subscription failed: ${JSON.stringify(msg.error)}`;
         console.warn(`[binance] ${this.lastError}`);
+      } else if (syms) {
+        // 确认前已被 release 的不算
+        const live = syms.filter((s) => this.symbols.has(s));
+        if (live.length) this.emit('connected', live, recv);
       }
       return;
     }

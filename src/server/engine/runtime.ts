@@ -47,8 +47,13 @@ class Series {
 interface Clock {
   lastE: number;
   recvLocal: number;
-  awaitingFirst: boolean;
 }
+
+/**
+ * 订阅生效时可能还没有任何交易所事件，只能用本地时间估算交易所时间；起点后推 1s，
+ * 吸收本地与交易所的时钟偏差（NTP 下通常远小于 1s）：只会晚一点就绪，不会把残缺窗口当完整。
+ */
+const LIVE_MARGIN_MS = 1_000;
 
 export interface RunnerStatus {
   id: number;
@@ -101,11 +106,10 @@ export class Runtime extends EventEmitter {
     hub.on('trade', (s, t, E, recv) => this.onTrade(s, t, E, recv));
     // ticker 不参与成交窗口的时钟与预热，只更新 24h 快照后立刻重算（边沿要抓得准）
     hub.on('ticker', (s, t) => this.onTicker(s, t));
-    hub.on('connected', (symbols) => {
-      for (const s of symbols) {
-        const c = this.clock(s);
-        c.awaitingFirst = true;
-      }
+    // 预热从订阅生效起算，而不是从第一笔成交：连接不断时"没有成交"是确定的事实，
+    // 冷门合约 5 分钟无成交，成交额就该是 0，而不是一直 WARMING（不变量 4 只针对断线/启动的数据缺口）
+    hub.on('connected', (symbols, at) => {
+      for (const s of symbols) this.windows.get(s)?.markContinuous(this.exAt(s, at) + LIVE_MARGIN_MS);
     });
     // 只作废断线那条连接上的市场；另一市场的连接仍在，窗口照常连续
     hub.on('disconnected', (_reason, symbols) => {
@@ -141,7 +145,7 @@ export class Runtime extends EventEmitter {
   private clock(symbol: string) {
     let c = this.clocks.get(symbol);
     if (!c) {
-      c = { lastE: 0, recvLocal: 0, awaitingFirst: true };
+      c = { lastE: 0, recvLocal: 0 };
       this.clocks.set(symbol, c);
     }
     return c;
@@ -149,9 +153,14 @@ export class Runtime extends EventEmitter {
 
   /** 估计当前交易所时间：最近事件时间 + 本地流逝时间 */
   private nowEx(symbol: string) {
+    return this.exAt(symbol, Date.now());
+  }
+
+  /** 本地时间 local 对应的交易所时间；尚无成交时只能用本地时间 */
+  private exAt(symbol: string, local: number) {
     const c = this.clocks.get(symbol);
-    if (!c || !c.recvLocal) return Date.now();
-    return c.lastE + (Date.now() - c.recvLocal);
+    if (!c || !c.recvLocal) return local;
+    return c.lastE + (local - c.recvLocal);
   }
 
   private symbolsInUse() {
@@ -195,10 +204,6 @@ export class Runtime extends EventEmitter {
     const c = this.clock(symbol);
     c.lastE = E;
     c.recvLocal = recv;
-    if (c.awaitingFirst) {
-      c.awaitingFirst = false;
-      w.markContinuous(E);
-    }
     w.push(t);
     w.advance(this.nowEx(symbol));
     this.evaluateSymbol(symbol);
