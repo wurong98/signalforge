@@ -56,6 +56,7 @@ src/server/api.ts            REST + SSE（/api/live 每秒推送状态）
 src/server/auth.ts           管理密码（首次设置 / 文件存储）+ 会话 Cookie + 登录限流
 src/server/db.ts             node:sqlite，表：webhooks signals events deliveries metric_points
 src/server/binance/stream.ts WS 连接（每对同时订阅 aggTrade + ticker）、重连、假死检测、环形缓存
+src/server/binance/symbols.ts 币安现货交易对目录（REST exchangeInfo，缓存 1h，助手用）
 src/server/engine/window.ts  增量滑动窗口累加器 + 24h ticker 快照
 src/server/engine/signal.ts  条件求值 + 状态机
 src/server/engine/runtime.ts 编排、采样、事件、派发
