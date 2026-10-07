@@ -10,6 +10,13 @@
  *
  * 对外一律使用"市场键"（现货 BTCUSDT，合约 BTCUSDT.P，见 dsl.ts marketKey）。
  * 合约 aggTrade / 24hrTicker 报文字段是现货的子集，解析逻辑通用。
+ *
+ * 合约连接另订阅全局流 `tradingSession`（/market 路由，每秒每个市场一条）：TradFi 永续
+ * （美股 / A 股 / 港股 / 韩股 / 商品 / 外汇）休市时没有成交，aggTrade 与 ticker 都不推送。
+ * 若连接上只有这类合约，休市期间会 30s 无消息被假死检测反复重连，每次重连都作废窗口，
+ * 午休（A 股 11:30–13:00）后还要重新预热。tradingSession 不停推送，顺带记录各市场当前时段。
+ * 报文：{e:"CN_EquityUpdate",E,t:时段开始,T:时段结束,S:"REGULAR"|"NO_TRADING"|...}，
+ * e 去掉 Update 后转大写即市场名（CN_EQUITY），与 exchangeInfo 的 underlyingType 一致。
  */
 import { EventEmitter } from 'node:events';
 import type { Product } from '../../shared/dsl.ts';
@@ -18,6 +25,20 @@ import type { Ticker, Trade } from '../engine/window.ts';
 
 export const STREAMS = ['aggTrade', 'ticker'] as const;
 export type StreamName = (typeof STREAMS)[number];
+/** 合约连接的全局流（不按交易对），见顶部注释 */
+export const SESSION_STREAM = 'tradingSession';
+
+/** TradFi 标的市场当前交易时段 */
+export interface MarketSession {
+  /** EQUITY / CN_EQUITY / HK_EQUITY / KR_EQUITY / COMMODITY / FX */
+  market: string;
+  /** REGULAR / NO_TRADING；美股另有 PRE_MARKET / AFTER_MARKET / OVERNIGHT */
+  type: string;
+  start: number;
+  end: number;
+  /** 交易所事件时间 */
+  E: number;
+}
 
 export interface StreamStats {
   stream: StreamName;
@@ -41,6 +62,8 @@ export interface HubStatus {
   reconnects: number;
   last_error: string | null;
   streams: StreamStats[];
+  /** 仅合约连接：各 TradFi 市场当前时段（按市场名排序） */
+  sessions?: MarketSession[];
 }
 
 const RAW_RING = 50;
@@ -74,6 +97,13 @@ function parseTicker(d: any): Ticker | null {
   return { E: d.E, last, high, low, change, changePct: pct / 100, volume, quoteVolume };
 }
 
+/** tradingSession 报文 → 时段；e 形如 EquityUpdate / CN_EquityUpdate / FXUpdate */
+export function parseSession(d: any): MarketSession | null {
+  const m = /^([A-Za-z_]+)Update$/.exec(String(d?.e ?? ''));
+  if (!m || typeof d.S !== 'string' || ![d.E, d.t, d.T].every(Number.isFinite)) return null;
+  return { market: m[1].toUpperCase(), type: d.S, start: d.t, end: d.T, E: d.E };
+}
+
 export class BinanceHub extends EventEmitter {
   private ws: WebSocket | null = null;
   private symbols = new Set<string>();
@@ -88,6 +118,7 @@ export class BinanceHub extends EventEmitter {
   private watchdog: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private stopped = false;
+  private sessions = new Map<string, MarketSession>();
 
   /** 交易所报文里的 symbol → 市场键 */
   private readonly suffix: string;
@@ -176,6 +207,7 @@ export class BinanceHub extends EventEmitter {
     this.reconnectTimer = null;
     if (this.stopped || !this.symbols.size) return;
     const streams = [...this.symbols].flatMap((s) => this.keysOf(s));
+    if (this.product === 'futures') streams.push(SESSION_STREAM);
     const url = `${this.baseUrl}/stream?streams=${streams.join('/')}`;
     this.status = 'connecting';
     for (const s of this.streams.values()) s.stats.status = 'connecting';
@@ -257,6 +289,12 @@ export class BinanceHub extends EventEmitter {
       }
       return;
     }
+    if (msg.stream === SESSION_STREAM) {
+      const s = parseSession(msg.data);
+      if (s) this.sessions.set(s.market, s);
+      else this.lastError = `malformed tradingSession: ${text.slice(0, 200)}`;
+      return;
+    }
     const st = this.streams.get(msg.stream);
     if (!st) return;
     const d = msg.data;
@@ -304,6 +342,7 @@ export class BinanceHub extends EventEmitter {
       reconnects: this.reconnects,
       last_error: this.lastError,
       streams: [...this.streams.values()].map((s) => ({ ...s.stats })),
+      ...(this.product === 'futures' ? { sessions: [...this.sessions.values()].sort((a, b) => a.market.localeCompare(b.market)) } : {}),
     };
   }
 

@@ -54,6 +54,22 @@ test('stream: 合约连接把交易所 symbol 转成 .P 市场键；流名不带
   assert.equal(hub.getStatus().product, 'futures');
 });
 
+test('stream: tradingSession 记录各 TradFi 市场时段，并算作连接活跃（不触发假死重连）', () => {
+  const hub = new BinanceHub('wss://x', 'futures');
+  (hub as any).addState('UNITREEUSDT.P');
+  (hub as any).lastMessageLocal = 0;
+  // 字段取自官方 SDK（binance-connector-js TradingSessionStreamResponse）与 /fapi/v1/tradingSchedule 实际返回
+  (hub as any).onMessage(JSON.stringify({ stream: 'tradingSession', data: { e: 'CN_EquityUpdate', E: 1790652601000, t: 1790652600000, T: 1790658000000, S: 'NO_TRADING' } }));
+  (hub as any).onMessage(JSON.stringify({ stream: 'tradingSession', data: { e: 'EquityUpdate', E: 1790652601000, t: 1790640000000, T: 1790668800000, S: 'OVERNIGHT' } }));
+  (hub as any).onMessage(JSON.stringify({ stream: 'tradingSession', data: { e: 'CN_EquityUpdate', E: 1790658001000, t: 1790658000000, T: 1790665020000, S: 'REGULAR' } }));
+  assert.ok((hub as any).lastMessageLocal > 0);
+  const st = hub.getStatus();
+  assert.deepEqual(st.sessions?.map((s) => [s.market, s.type]), [['CN_EQUITY', 'REGULAR'], ['EQUITY', 'OVERNIGHT']]);
+  // 不是交易对流：不计入任何流的统计，也不算畸形报文
+  assert.ok(st.streams.every((s) => s.messages_total === 0 && s.malformed_total === 0));
+  assert.equal(new BinanceHub('wss://x', 'spot').getStatus().sessions, undefined);
+});
+
 test('stream: 无订阅时不建立连接（合约按需连接，避免空连接被假死检测反复重连）', () => {
   const hub = new MarketHub('wss://spot.invalid', 'wss://fut.invalid');
   const orig = globalThis.WebSocket;
@@ -73,7 +89,8 @@ test('stream: 无订阅时不建立连接（合约按需连接，避免空连接
     assert.match(opened[0], /^wss:\/\/spot\.invalid\/stream\?streams=btcusdt@aggTrade\/btcusdt@ticker$/);
     hub.ensure('ETHUSDT.P');
     assert.equal(opened.length, 2);
-    assert.match(opened[1], /^wss:\/\/fut\.invalid\/stream\?streams=ethusdt@aggTrade\/ethusdt@ticker$/);
+    // 合约连接带上全局 tradingSession：TradFi 休市时不会因无消息被假死检测反复重连；现货不订阅
+    assert.match(opened[1], /^wss:\/\/fut\.invalid\/stream\?streams=ethusdt@aggTrade\/ethusdt@ticker\/tradingSession$/);
     hub.release('ETHUSDT.P');
     assert.equal(hub.hubs.futures.getStatus().status, 'disconnected');
   } finally {

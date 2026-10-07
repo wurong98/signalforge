@@ -48,6 +48,7 @@ Binance Signal Studio：自然语言 → Signal DSL → 确定性 Runtime（Bina
     - 合约连接按需建立，无合约 Signal 时不连接（空连接会被假死检测反复重连）；
     - 合约 WS 必须走 `/market` 路由（`wss://fstream.binance.com/market`），2026-04-23 起无路由旧地址下线，aggTrade / ticker 不在 `/public`；
     - 只支持永续（`PERPETUAL` / `TRADIFI_PERPETUAL`）；交割合约会到期换代，币本位不支持。
+    - 合约连接始终带上全局流 `tradingSession`，不要去掉。TradFi 永续（美股 / A 股 / 港股等）休市时 aggTrade、ticker 都不推送，只有这条流每秒不断；没有它，休市期间会被假死检测反复重连、作废窗口，开盘后还得重新预热。市场名 = 报文 `e` 去掉 `Update` 后转大写（`CN_EquityUpdate` → `CN_EQUITY`），与 exchangeInfo 的 `underlyingType` 对应。
 
 ## 代码地图
 
