@@ -7,7 +7,7 @@ import { validateSpec } from '../src/shared/dsl.ts';
 import { Db } from '../src/server/db.ts';
 import { extractJson, parseNaturalLanguage } from '../src/server/nl/parse.ts';
 import { parseWithRules } from '../src/server/nl/rules.ts';
-import { WebhookDispatcher, isPrivateAddress, sign } from '../src/server/webhook/delivery.ts';
+import { type Transport, WebhookDispatcher, isPrivateAddress, sign } from '../src/server/webhook/delivery.ts';
 import { checkFeishuResponse, feishuSign, toFeishuMessage } from '../src/server/webhook/feishu.ts';
 import { isFeishuWebhook } from '../src/shared/webhook.ts';
 
@@ -264,17 +264,16 @@ test('feishu: response body decides success', () => {
 });
 
 test('feishu: HTTP 200 with error code is logged as a failed delivery', async () => {
-  const realFetch = globalThis.fetch;
   const sent: any[] = [];
   const replies = ['{"code":19002,"msg":"params error, msg_type need"}', '{"code":0,"msg":"success"}'];
-  globalThis.fetch = (async (_url: string, init: RequestInit) => {
-    sent.push({ headers: init.headers, body: JSON.parse(String(init.body)) });
-    return new Response(replies[sent.length - 1], { status: 200 });
-  }) as typeof fetch;
-  try {
+  const transport: Transport = async (r) => {
+    sent.push({ headers: r.headers, body: JSON.parse(r.body) });
+    return { status: 200, text: r.readBody(200) ? replies[sent.length - 1] : null };
+  };
+  {
     const db = new Db(':memory:');
     const id = db.insertWebhook({ name: 'ai-lab', url: 'https://open.feishu.cn/open-apis/bot/v2/hook/xxxxx', method: 'POST', headers: {}, secret: 'demo', timeout_ms: 2000, max_retries: 3 });
-    const d = new WebhookDispatcher(db, true, () => {}, [10, 10, 10]);
+    const d = new WebhookDispatcher(db, true, () => {}, [10, 10, 10], transport);
     const w = db.getWebhook(id)!;
 
     const bad = await d.deliver(w, { event: 'signal.test', symbol: 'BTCUSDT' }, null, true);
@@ -288,7 +287,5 @@ test('feishu: HTTP 200 with error code is logged as a failed delivery', async ()
     assert.equal(sent[1].body.msg_type, 'interactive');
     assert.ok(sent[1].body.sign, '请求体带飞书签名');
     assert.equal((sent[1].headers as Record<string, string>)['x-signalforge-signature'], undefined);
-  } finally {
-    globalThis.fetch = realFetch;
   }
 });

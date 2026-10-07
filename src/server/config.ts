@@ -15,6 +15,9 @@ export const config = {
   binanceRest: env.BINANCE_REST_URL ?? 'https://api.binance.com',
   symbols: (env.SYMBOLS ?? 'BTCUSDT').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean),
   allowPrivateWebhooks: env.ALLOW_PRIVATE_WEBHOOKS === 'true',
+  // 每 IP 每分钟次数：parse 每次都调用 LLM（计费），webhook test 每次都对外发请求
+  parseRateLimit: Number(env.PARSE_RATE_LIMIT ?? 20),
+  webhookTestRateLimit: Number(env.WEBHOOK_TEST_RATE_LIMIT ?? 10),
   metricRetentionDays: Number(env.METRIC_RETENTION_DAYS ?? 7),
   llm: (llmKey && llmBase ? { baseUrl: llmBase, apiKey: llmKey, model: env.LLM_MODEL || 'MiniMax-M2' } : null) as LlmConfig | null,
   production: env.NODE_ENV === 'production',

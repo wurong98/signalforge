@@ -33,7 +33,7 @@ Binance Signal Studio：自然语言 → Signal DSL → 确定性 Runtime（Bina
 4. **窗口未就绪返回 null，不返回 0**。启动/重连后连续接收时长 < 窗口长度时，Signal 处于 `WARMING`，不得触发。
 5. **只在边沿触发**。状态机见 `src/server/engine/signal.ts` 顶部注释；启动时已满足的条件不触发。改状态机必须同步改 `test/engine.test.ts` 中的状态机用例。
 6. **事件自包含**。`events` 表保存触发时的 `spec` 快照与每个叶子条件的左右值；Explain 只读快照，不读当前 Signal 定义。
-7. **Webhook 安全**：默认拒绝私有地址、不跟随重定向。不要为了方便测试去掉这些检查——用 `ALLOW_PRIVATE_WEBHOOKS=true`。
+7. **Webhook 安全**：默认拒绝私有地址、不跟随重定向。地址校验必须在**建连时的 lookup 钩子**里做（`delivery.ts` 的 `guardedLookup`），不要改回"先解析校验、再交给 fetch"——那样会被 DNS rebinding 绕过。不要为了方便测试去掉这些检查——用 `ALLOW_PRIVATE_WEBHOOKS=true`。返回给前端的 Webhook secret 与 header 值一律经 `maskWebhook()` 打码。
 8. 事件与投递日志**永久保留**，删除 Signal 不删它们。
 9. **长周期需求走 `kind:"ticker"`，不得退化成窗口近似**。aggTrade 窗口上限 60s，"24 小时新低"这类语义只能由 `<symbol>@ticker`（交易所侧维护的 24h 滚动统计，每秒下发、无预热）表达。两个配套约束：
    - ticker **不参与**成交窗口的时钟与预热（`nowEx` / `continuousSince` 仍只由 aggTrade 驱动），只更新快照；
@@ -56,7 +56,8 @@ src/server/binance/stream.ts WS 连接（每对同时订阅 aggTrade + ticker）
 src/server/engine/window.ts  增量滑动窗口累加器 + 24h ticker 快照
 src/server/engine/signal.ts  条件求值 + 状态机
 src/server/engine/runtime.ts 编排、采样、事件、派发
-src/server/webhook/delivery.ts  签名 / 重试 / SSRF
+src/server/webhook/delivery.ts  签名 / 重试 / SSRF（建连时校验 IP）
+src/server/ratelimit.ts      固定窗口限流（/api/parse、Webhook 测试）
 src/server/nl/parse.ts       LLM 解析 + 校验修复循环
 src/server/nl/rules.ts       规则解析兜底 + 噪声下限 + 24h 档
 web/src/                     React 前端（lib.ts 为 API/类型/格式化）

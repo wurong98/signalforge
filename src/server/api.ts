@@ -4,12 +4,42 @@ import { CATALOG, CATALOG_BY_NAME, catalogDescription } from '../shared/catalog.
 import { SYMBOL_RE, WebhookInputSchema, describeFormula, metricUnit, validateSpec } from '../shared/dsl.ts';
 import type { BinanceHub } from './binance/stream.ts';
 import { config } from './config.ts';
-import type { Db } from './db.ts';
+import type { Db, WebhookRow } from './db.ts';
 import type { Runtime } from './engine/runtime.ts';
 import { parseNaturalLanguage } from './nl/parse.ts';
+import { RateLimiter } from './ratelimit.ts';
 import type { WebhookDispatcher } from './webhook/delivery.ts';
 
 const RANGES: Record<string, number> = { '1m': 60_000, '5m': 300_000, '15m': 900_000, '1h': 3_600_000 };
+
+/** 返回给前端的 Webhook 一律打码：secret 与自定义 header 的值（通常是第三方 API 的凭据）只写不读 */
+export const MASK = '••••••';
+export function maskWebhook(w: WebhookRow) {
+  return {
+    ...w,
+    secret: w.secret ? MASK : '',
+    headers: Object.fromEntries(Object.keys(w.headers).map((k) => [k, MASK])),
+  };
+}
+
+/**
+ * 前端回传的仍是掩码时保留原值（用户没改）。header 改了名但值还是掩码，就无从知道原值，
+ * 返回错误让用户重新填写，而不是把掩码字面量存进库里。
+ */
+export function unmaskWebhookInput(input: any, cur: WebhookRow): { input: any } | { error: string } {
+  const out = { ...input };
+  if (out.secret === MASK) out.secret = cur.secret;
+  if (out.headers && typeof out.headers === 'object') {
+    const headers: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(out.headers)) {
+      if (v !== MASK) headers[k] = v;
+      else if (k in cur.headers) headers[k] = cur.headers[k];
+      else return { error: `请重新填写 header ${k} 的值` };
+    }
+    out.headers = headers;
+  }
+  return { input: out };
+}
 
 function bad(reply: FastifyReply, errors: string[] | string, code = 400) {
   return reply.code(code).send({ errors: Array.isArray(errors) ? errors : [errors] });
@@ -29,6 +59,15 @@ async function checkSymbol(symbol: string): Promise<string | null> {
 export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runtime; hub: BinanceHub; dispatcher: WebhookDispatcher }) {
   const { db, runtime, hub, dispatcher } = deps;
   const idParam = (req: any) => Number(req.params.id);
+  const parseLimit = new RateLimiter(config.parseRateLimit, 60_000);
+  const testLimit = new RateLimiter(config.webhookTestRateLimit, 60_000);
+  const limited = (limiter: RateLimiter, req: any, reply: FastifyReply) => {
+    const wait = limiter.take(req.ip);
+    if (!wait) return false;
+    reply.header('retry-after', String(wait));
+    bad(reply, `请求过于频繁，请 ${wait} 秒后再试`, 429);
+    return true;
+  };
 
   // ---------- 系统状态 / 实时推送 ----------
   const statusPayload = () => {
@@ -63,6 +102,7 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
 
   // ---------- 自然语言 ----------
   app.post('/api/parse', async (req, reply) => {
+    if (limited(parseLimit, req, reply)) return reply;
     const body = z.object({ text: z.string().min(2).max(1000) }).safeParse(req.body);
     if (!body.success) return bad(reply, '请输入要监控的内容');
     const out = await parseNaturalLanguage(body.data.text, config.llm);
@@ -120,7 +160,7 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
     if (!s) return bad(reply, 'not found', 404);
     return {
       ...s,
-      webhook: s.webhook_id ? db.getWebhook(s.webhook_id) : null,
+      webhook: s.webhook_id ? maskWebhook(db.getWebhook(s.webhook_id)!) : null,
       runtime: runtime.status(s.id),
       metrics: s.spec.metrics.map((m) => ({ ...m, formula: describeFormula(m), unit: metricUnit(m, s.spec.metrics) })),
     };
@@ -190,8 +230,7 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
   // ---------- Webhooks ----------
   app.get('/api/webhooks', async () =>
     db.listWebhooks().map((w) => ({
-      ...w,
-      secret: w.secret ? '••••••' : '',
+      ...maskWebhook(w),
       stats: db.webhookStats(w.id),
       signals: db.listSignals().filter((s) => s.webhook_id === w.id).map((s) => ({ id: s.id, title: s.spec.title })),
     })),
@@ -207,10 +246,9 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
     const id = idParam(req);
     const cur = db.getWebhook(id);
     if (!cur) return bad(reply, 'not found', 404);
-    const input = { ...(req.body as any) };
-    // 前端拿到的是掩码，未修改时保留原 secret
-    if (input.secret === '••••••') input.secret = cur.secret;
-    const b = WebhookInputSchema.safeParse(input);
+    const u = unmaskWebhookInput(req.body ?? {}, cur);
+    if ('error' in u) return bad(reply, u.error);
+    const b = WebhookInputSchema.safeParse(u.input);
     if (!b.success) return bad(reply, b.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`));
     db.updateWebhook(id, b.data);
     runtime.sync();
@@ -226,6 +264,7 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
   app.post('/api/webhooks/:id/test', async (req, reply) => {
     const w = db.getWebhook(idParam(req));
     if (!w) return bad(reply, 'not found', 404);
+    if (limited(testLimit, req, reply)) return reply;
     // 飞书测试卡片用真实行情快照；通用 Webhook 的测试报文不变
     const live = runtime.latestTicker();
     const payload = {
