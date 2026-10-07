@@ -4,7 +4,7 @@
 
 ## 项目一句话
 
-Binance Signal Studio：自然语言 → Signal DSL → 确定性 Runtime（Binance aggTrade → 滑动窗口指标 → 条件 → 状态机 → Event → Webhook）。
+Binance Signal Studio：自然语言 → Signal DSL → 确定性 Runtime（Binance aggTrade → 滑动窗口指标 → 条件 → 状态机 → Event → Webhook）。支持现货与 U 本位永续合约。
 
 ## 常用命令
 
@@ -43,6 +43,12 @@ Binance Signal Studio：自然语言 → Signal DSL → 确定性 Runtime（Bina
 10. **所有 `/api/*` 必须经过管理密码鉴权**（`src/server/auth.ts` 的 onRequest 钩子，须先于业务路由注册），仅 `/api/auth/{status,login,setup}` 例外。新增接口不得绕过；未设置密码时同样拦截。密码哈希在 `ADMIN_FILE`（默认 `data/admin.json`），删除即重置。
 11. **助手（`src/server/nl/chat.ts`）只读**。工具（`nl/tools.ts`）只能调用 Runtime / Db 的只读方法，不得写库、不得启停或保存 Signal；建/改 Signal 只产出提案，保存必须由用户在界面确认后走 `/api/signals`。工具输出按字段白名单构造，不得包含 webhook url / headers / secret；指标值为 null 时原样返回（不变量 4）；指标历史超出 `METRIC_RETENTION_DAYS` 的区间直接拒答，不用部分数据回答。思考模式按用途分开：生成 DSL 开，对话工具循环关（带工具开思考须逐轮回传 `reasoning_content`）。方案见 `docs/llm-assistant-plan.md`。
 
+12. **现货与合约是两个市场，内部一律用市场键**。币安两边符号写法相同（都是 `BTCUSDT`），DSL 用 `market.product`（`spot` / `futures` = U 本位永续）区分，`market.symbol` 始终是交易所原始符号；系统内部（窗口、时钟、指标历史、事件 `symbol`、助手工具参数、`SYMBOLS`）用 `marketKey()`：现货 `BTCUSDT`，合约 `BTCUSDT.P`。不要直接拿 `spec.market.symbol` 当键，否则同名现货/合约会串数据。Webhook payload 的 `symbol` 保持原始符号，靠 `market` 字段区分。
+    - 两个市场各一条 WS 连接（`MarketHub`），独立重连；一条断线只作废该市场的窗口（`disconnected` 事件带受影响的市场键）；
+    - 合约连接按需建立，无合约 Signal 时不连接（空连接会被假死检测反复重连）；
+    - 合约 WS 必须走 `/market` 路由（`wss://fstream.binance.com/market`），2026-04-23 起无路由旧地址下线，aggTrade / ticker 不在 `/public`；
+    - 只支持永续（`PERPETUAL` / `TRADIFI_PERPETUAL`）；交割合约会到期换代，币本位不支持。
+
 ## 代码地图
 
 ```
@@ -55,8 +61,8 @@ src/server/version.ts        读取 git commit / dirty（服务启动与 vite �
 src/server/api.ts            REST + SSE（/api/live 每秒推送状态）
 src/server/auth.ts           管理密码（首次设置 / 文件存储）+ 会话 Cookie + 登录限流
 src/server/db.ts             node:sqlite，表：webhooks signals events deliveries metric_points
-src/server/binance/stream.ts WS 连接（每对同时订阅 aggTrade + ticker）、重连、假死检测、环形缓存
-src/server/binance/symbols.ts 币安现货交易对目录（REST exchangeInfo，缓存 1h，助手用）
+src/server/binance/stream.ts WS 连接（每对同时订阅 aggTrade + ticker）、重连、假死检测、环形缓存；MarketHub 组合现货/合约两条连接
+src/server/binance/symbols.ts 币安交易对目录：现货 + U 本位永续（REST exchangeInfo，缓存 1h，助手 / Data Sources 用）
 src/server/engine/window.ts  增量滑动窗口累加器 + 24h ticker 快照
 src/server/engine/signal.ts  条件求值 + 状态机
 src/server/engine/runtime.ts 编排、采样、事件、派发

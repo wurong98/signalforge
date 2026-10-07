@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useState } from 'react';
 import type { WebBuild } from '../../src/shared/build.ts';
 import type { SignalSpec } from '../../src/shared/dsl.ts';
+import { parseMarketKey } from '../../src/shared/dsl.ts';
 
 /** vite 构建时写入（vite.config.ts 的 define） */
 declare const __WEB_BUILD__: WebBuild;
@@ -61,7 +62,11 @@ export interface StreamStats {
 }
 export interface LiveTick {
   server_time: number;
-  binance: { status: string; url: string; connected_since: number | null; reconnects: number; last_error: string | null; streams: StreamStats[] };
+  binance: {
+    status: string; url: string; connected_since: number | null; reconnects: number; last_error: string | null; streams: StreamStats[];
+    /** 每个市场一条连接（现货 / U 本位永续） */
+    connections?: { product: 'spot' | 'futures'; status: string; url: string; connected_since: number | null; reconnects: number; last_error: string | null }[];
+  };
   symbols: {
     symbol: string;
     ready_60s: boolean;
@@ -206,8 +211,12 @@ export function fmtThreshold(g: Gauge | undefined, op: string, unit = ''): strin
   return `${op} ${g.kind === 'ratio' ? fmtNum(g.threshold, 'x') : fmtNum(g.threshold, unit)}`;
 }
 
-export const binanceChartUrl = (symbol: string) => {
+/** 参数为市场键：现货 BTCUSDT，U 本位永续 BTCUSDT.P */
+export const binanceChartUrl = (key: string) => {
+  const { product, symbol } = parseMarketKey(key);
+  if (product === 'futures') return `https://www.binance.com/en/futures/${symbol}`;
   const quote = ['USDT', 'USDC', 'FDUSD', 'BTC'].find((q) => symbol.endsWith(q)) ?? 'USDT';
   return `https://www.binance.com/en/trade/${symbol.slice(0, -quote.length)}_${quote}?type=spot`;
 };
-export const tradingViewUrl = (symbol: string) => `https://www.tradingview.com/chart/?symbol=BINANCE:${symbol}`;
+// TradingView 的永续写法正好也是 .P 后缀，市场键可直接用
+export const tradingViewUrl = (key: string) => `https://www.tradingview.com/chart/?symbol=BINANCE:${key}`;

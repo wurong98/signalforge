@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import type { SignalSpec } from '../../../src/shared/dsl.ts';
-import { metricUnit } from '../../../src/shared/dsl.ts';
+import { marketKey, metricUnit } from '../../../src/shared/dsl.ts';
 import { LineChart } from '../components/LineChart.tsx';
 import { ExplainPanel, Section, SpecView, StateBadge } from '../components/bits.tsx';
 import type { Delivery, EventRow, SignalRow } from '../lib.ts';
@@ -79,14 +79,16 @@ export function SignalDetailPage() {
           <div className="row">
             {rt && <StateBadge state={rt.state} error={rt.error} />}
             <span className="muted small">
-              Last Event {streamLatency?.last_message_local ? fmtAgo(streamLatency.last_message_local, now) : '—'} · Last Evaluation{' '}
+              {/* 触发时间与行情心跳分开显示：后者只说明连接活着，不代表 Signal 触发过 */}
+              Last Trigger {fmtAgo(rt?.last_event_ts, now)} · Last Message{' '}
+              {streamLatency?.last_message_local ? fmtAgo(streamLatency.last_message_local, now) : '—'} · Last Evaluation{' '}
               {fmtAgo(rt?.last_eval_local, now)}
             </span>
           </div>
         </div>
         <div className="row">
-          <a className="button ghost" href={binanceChartUrl(row.spec.market.symbol)} target="_blank" rel="noreferrer">Open Binance Chart ↗</a>
-          <a className="button ghost" href={tradingViewUrl(row.spec.market.symbol)} target="_blank" rel="noreferrer">Open TradingView ↗</a>
+          <a className="button ghost" href={binanceChartUrl(marketKey(row.spec.market))} target="_blank" rel="noreferrer">Open Binance Chart ↗</a>
+          <a className="button ghost" href={tradingViewUrl(marketKey(row.spec.market))} target="_blank" rel="noreferrer">Open TradingView ↗</a>
         </div>
       </div>
 

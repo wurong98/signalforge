@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { SymbolDirectory } from '../src/server/binance/symbols.ts';
+import { MarketDirectory, SymbolDirectory } from '../src/server/binance/symbols.ts';
 import { Db } from '../src/server/db.ts';
 import type { ChatTurn } from '../src/server/nl/chat.ts';
 import { MAX_ROUNDS, runChat, trimHistory } from '../src/server/nl/chat.ts';
@@ -136,18 +136,14 @@ test('tools: list_symbols 带 24h 成交额', async () => {
 
 test('tools: search_binance_symbols 区分"可监控"与"已订阅"', async () => {
   const { deps } = fixture();
+  const spot = (symbol: string, base: string, quote: string) => ({ symbol, base, quote, product: 'spot' as const, key: symbol });
   deps.directory = {
-    list: async () => [
-      { symbol: 'BTCUSDT', base: 'BTC', quote: 'USDT' },
-      { symbol: 'XPLUSDT', base: 'XPL', quote: 'USDT' },
-      { symbol: 'XPLBTC', base: 'XPL', quote: 'BTC' },
-      { symbol: 'ETHBTC', base: 'ETH', quote: 'BTC' },
-    ],
+    list: async () => [spot('BTCUSDT', 'BTC', 'USDT'), spot('XPLUSDT', 'XPL', 'USDT'), spot('XPLBTC', 'XPL', 'BTC'), spot('ETHBTC', 'ETH', 'BTC')],
   };
   const r = (await call(deps, 'search_binance_symbols', { query: 'xpl', quote: 'usdt' })).result as any;
   assert.equal(r.total_trading_spot, 4);
-  assert.equal(r.in_quote, 2);
-  assert.deepEqual(r.matches, [{ symbol: 'XPLUSDT', subscribed: false }]);
+  assert.equal(r.in_filter, 2);
+  assert.deepEqual(r.matches, [{ symbol: 'XPLUSDT', market: 'spot', subscribed: false }]);
   assert.deepEqual(r.subscribed, ['BTCUSDT', 'ETHUSDT']);
   // 带 query 不指定 quote 时跨所有计价币
   const any = (await call(deps, 'search_binance_symbols', { query: 'XPL' })).result as any;
@@ -163,6 +159,46 @@ test('tools: search_binance_symbols 区分"可监控"与"已订阅"', async () =
   assert.equal(listAll.symbols.length, 4);
   deps.directory = { list: async () => Promise.reject(new Error('offline')) };
   assert.equal(((await call(deps, 'search_binance_symbols', {})).result as any).error, 'unavailable');
+});
+
+test('tools: search_binance_symbols 同时覆盖 U 本位永续（含 TradFi），合约用 .P 市场键', async () => {
+  const { deps } = fixture();
+  deps.directory = {
+    list: async () => [
+      { symbol: 'BTCUSDT', base: 'BTC', quote: 'USDT', product: 'spot', key: 'BTCUSDT' },
+      { symbol: 'BTCUSDT', base: 'BTC', quote: 'USDT', product: 'futures', key: 'BTCUSDT.P', contract: 'PERPETUAL' },
+      { symbol: 'QQQUSDT', base: 'QQQ', quote: 'USDT', product: 'futures', key: 'QQQUSDT.P', contract: 'TRADIFI_PERPETUAL' },
+    ],
+  };
+  const q = (await call(deps, 'search_binance_symbols', { query: 'QQQ' })).result as any;
+  assert.deepEqual(q.matches, [{ symbol: 'QQQUSDT.P', market: 'futures', tradfi: true, subscribed: false }]);
+  assert.equal(q.total_trading_futures_perpetual, 2);
+  // 同名交易对两个市场都列出，现货在前；已订阅按市场键判断
+  const b = (await call(deps, 'search_binance_symbols', { query: 'BTC' })).result as any;
+  assert.deepEqual(b.matches.map((m: any) => [m.symbol, m.subscribed]), [['BTCUSDT', true], ['BTCUSDT.P', false]]);
+  const fut = (await call(deps, 'search_binance_symbols', { list: true, market: 'futures' })).result as any;
+  assert.deepEqual(fut.symbols, ['BTCUSDT.P', 'QQQUSDT.P']);
+  // 默认 list 只列现货
+  assert.deepEqual(((await call(deps, 'search_binance_symbols', { list: true })).result as any).symbols, ['BTCUSDT']);
+});
+
+test('symbols: 合约目录只收 TRADING 的永续（含 TradFi），排除交割合约；一边失败不影响另一边', async () => {
+  const fake = (async (url: string) => {
+    if (String(url).includes('/api/v3/')) throw new Error('spot down');
+    return new Response(JSON.stringify({ symbols: [
+      { symbol: 'BTCUSDT', baseAsset: 'BTC', quoteAsset: 'USDT', status: 'TRADING', contractType: 'PERPETUAL' },
+      { symbol: 'QQQUSDT', baseAsset: 'QQQ', quoteAsset: 'USDT', status: 'TRADING', contractType: 'TRADIFI_PERPETUAL' },
+      { symbol: 'BTCUSDT_261225', baseAsset: 'BTC', quoteAsset: 'USDT', status: 'TRADING', contractType: 'CURRENT_QUARTER' },
+      { symbol: 'OLDUSDT', baseAsset: 'OLD', quoteAsset: 'USDT', status: 'SETTLING', contractType: 'PERPETUAL' },
+    ] }));
+  }) as typeof fetch;
+  const dir = new MarketDirectory('https://spot', 'https://fapi', fake);
+  const list = await dir.list();
+  assert.deepEqual(list.map((s) => s.key), ['BTCUSDT.P', 'QQQUSDT.P']);
+  assert.equal(list[1].contract, 'TRADIFI_PERPETUAL');
+  assert.match(dir.errors.spot!, /spot down/);
+  const down = new MarketDirectory('https://spot', 'https://fapi', (async () => { throw new Error('x'); }) as typeof fetch);
+  await assert.rejects(down.list());
 });
 
 test('symbols: exchangeInfo 只保留 TRADING，缓存 1 小时，失败沿用旧缓存', async () => {

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { isLeaf } from '../../../src/shared/dsl.ts';
+import { isLeaf, marketKey } from '../../../src/shared/dsl.ts';
 import { StateBadge } from '../components/bits.tsx';
 import type { SignalRow } from '../lib.ts';
 import { api, fmtAgo, fmtGauge, fmtThreshold, useLive, useNow } from '../lib.ts';
@@ -61,7 +61,7 @@ export function SignalsPage() {
             <div key={row.id} className={`card signal-card ${hot ? 'hot' : ''}`}>
               <div className="signal-card-head">
                 <Link to={`/signals/${row.id}`} className="title">{row.spec.title}</Link>
-                <span className="tag">{row.spec.market.symbol}</span>
+                <span className="tag">{marketKey(row.spec.market)}</span>
               </div>
               <div className="gauge-row">
                 <div>

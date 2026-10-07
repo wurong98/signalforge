@@ -13,6 +13,12 @@ export const config = {
   adminFile: env.ADMIN_FILE ?? './data/admin.json',
   binanceWs: env.BINANCE_WS_URL ?? 'wss://stream.binance.com:9443',
   binanceRest: env.BINANCE_REST_URL ?? 'https://api.binance.com',
+  // U 本位永续合约（USDⓈ-M）；只有用到合约的 Signal 时才会连接。
+  // 必须带 /market 路由：2026-04-23 起无路由的旧地址下线，aggTrade / ticker 属于 /market，
+  // 连到其他路由不会推送这两类流
+  binanceFuturesWs: env.BINANCE_FUTURES_WS_URL ?? 'wss://fstream.binance.com/market',
+  binanceFuturesRest: env.BINANCE_FUTURES_REST_URL ?? 'https://fapi.binance.com',
+  // 市场键：现货 BTCUSDT，合约 BTCUSDT.P
   symbols: (env.SYMBOLS ?? 'BTCUSDT').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean),
   allowPrivateWebhooks: env.ALLOW_PRIVATE_WEBHOOKS === 'true',
   metricRetentionDays: Number(env.METRIC_RETENTION_DAYS ?? 7),

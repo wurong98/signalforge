@@ -1,5 +1,5 @@
 /**
- * Binance Spot 公共行情 WebSocket（PRD §4 §18 §20 §25）。
+ * Binance 公共行情 WebSocket（PRD §4 §18 §20 §25）：现货与 U 本位永续合约各一条连接。
  * 使用 combined stream，动态 SUBSCRIBE/UNSUBSCRIBE；断线指数退避重连；
  * 30s 无消息视为假死并主动重连；原始事件保留在内存环形缓存供 Data Sources 页查看。
  *
@@ -7,8 +7,13 @@
  * - `<symbol>@aggTrade` 逐笔聚合成交，驱动本地滑动窗口指标（最长 5m）；
  * - `<symbol>@ticker` 交易所侧维护的 24h 滚动统计，用来表达 aggTrade 窗口无法覆盖的
  *   长时间跨度需求（24h 新低、24h 涨跌幅），无需本地预热。
+ *
+ * 对外一律使用"市场键"（现货 BTCUSDT，合约 BTCUSDT.P，见 dsl.ts marketKey）。
+ * 合约 aggTrade / 24hrTicker 报文字段是现货的子集，解析逻辑通用。
  */
 import { EventEmitter } from 'node:events';
+import type { Product } from '../../shared/dsl.ts';
+import { FUTURES_SUFFIX, parseMarketKey } from '../../shared/dsl.ts';
 import type { Ticker, Trade } from '../engine/window.ts';
 
 export const STREAMS = ['aggTrade', 'ticker'] as const;
@@ -29,6 +34,7 @@ export interface StreamStats {
 }
 
 export interface HubStatus {
+  product: Product;
   status: 'connecting' | 'connected' | 'disconnected';
   url: string;
   connected_since: number | null;
@@ -49,7 +55,8 @@ export declare interface BinanceHub {
   on(ev: 'trade', fn: (symbol: string, t: Trade, eventTime: number, recvLocal: number) => void): this;
   on(ev: 'ticker', fn: (symbol: string, t: Ticker, eventTime: number, recvLocal: number) => void): this;
   on(ev: 'connected', fn: (symbols: string[], at: number) => void): this;
-  on(ev: 'disconnected', fn: (reason: string) => void): this;
+  /** symbols：这条连接上受影响的市场键（只作废这些窗口，另一市场不受影响） */
+  on(ev: 'disconnected', fn: (reason: string, symbols: string[]) => void): this;
 }
 
 /** 24h ticker 报文 → 归一化快照；P 由百分数转为小数，与 DSL 百分比约定一致 */
@@ -82,12 +89,18 @@ export class BinanceHub extends EventEmitter {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private stopped = false;
 
-  constructor(private baseUrl: string) {
+  /** 交易所报文里的 symbol → 市场键 */
+  private readonly suffix: string;
+  private started = false;
+
+  constructor(private baseUrl: string, readonly product: Product = 'spot') {
     super();
+    this.suffix = product === 'futures' ? FUTURES_SUFFIX : '';
   }
 
+  /** 流名用交易所原始 symbol（小写），不带市场后缀 */
   private key(symbol: string, stream: StreamName) {
-    return `${symbol.toLowerCase()}@${stream}`;
+    return `${parseMarketKey(symbol).symbol.toLowerCase()}@${stream}`;
   }
 
   private keysOf(symbol: string) {
@@ -97,6 +110,7 @@ export class BinanceHub extends EventEmitter {
   start(symbols: string[]) {
     for (const s of symbols) this.addState(s);
     symbols.forEach((s) => this.symbols.add(s));
+    this.started = true;
     this.connect();
     this.watchdog = setInterval(() => this.checkStall(), 5_000);
   }
@@ -130,19 +144,37 @@ export class BinanceHub extends EventEmitter {
     this.addState(symbol);
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ method: 'SUBSCRIBE', params: this.keysOf(symbol), id: this.reqId++ }));
+    } else if (this.started && !this.ws && !this.reconnectTimer) {
+      // 空闲（无订阅未连接）时按需建立连接；连接中 / 等待重连时由 connect() 带上全部流
+      this.connect();
     }
   }
 
   release(symbol: string) {
     if (!this.symbols.delete(symbol)) return;
     for (const k of this.keysOf(symbol)) this.streams.delete(k);
+    if (!this.symbols.size) return this.idle();
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ method: 'UNSUBSCRIBE', params: this.keysOf(symbol), id: this.reqId++ }));
     }
   }
 
+  /** 无订阅：断开且不重连（否则空连接收不到消息，会被假死检测反复重连） */
+  private idle() {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    const ws = this.ws;
+    this.ws = null;
+    this.status = 'disconnected';
+    this.connectedSince = null;
+    try {
+      ws?.close();
+    } catch {}
+  }
+
   private connect() {
-    if (this.stopped) return;
+    this.reconnectTimer = null;
+    if (this.stopped || !this.symbols.size) return;
     const streams = [...this.symbols].flatMap((s) => this.keysOf(s));
     const url = `${this.baseUrl}/stream?streams=${streams.join('/')}`;
     this.status = 'connecting';
@@ -181,7 +213,7 @@ export class BinanceHub extends EventEmitter {
       s.stats.status = 'disconnected';
       s.stats.last_error = reason;
     }
-    this.emit('disconnected', reason);
+    this.emit('disconnected', reason, [...this.symbols]);
     if (this.stopped) return;
     this.reconnects++;
     const delay = this.backoffMs;
@@ -252,9 +284,9 @@ export class BinanceHub extends EventEmitter {
     if (st.raw.length > RAW_RING) st.raw.shift();
 
     if (st.stats.stream === 'ticker') {
-      this.emit('ticker', d.s as string, payload as Ticker, d.E as number, recv);
+      this.emit('ticker', `${d.s}${this.suffix}`, payload as Ticker, d.E as number, recv);
     } else {
-      this.emit('trade', d.s as string, payload as Trade, d.E as number, recv);
+      this.emit('trade', `${d.s}${this.suffix}`, payload as Trade, d.E as number, recv);
     }
   }
 
@@ -265,6 +297,7 @@ export class BinanceHub extends EventEmitter {
       s.stats.messages_per_min = s.recent.length;
     }
     return {
+      product: this.product,
       status: this.status,
       url: this.baseUrl,
       connected_since: this.connectedSince,
@@ -277,5 +310,58 @@ export class BinanceHub extends EventEmitter {
   /** Data Sources 页用：`${symbol}@${stream}` → 最近的原始报文（最新在前） */
   samples(symbol: string, stream: StreamName = 'aggTrade'): unknown[] {
     return [...(this.streams.get(this.key(symbol, stream))?.raw ?? [])].reverse();
+  }
+}
+
+export declare interface MarketHub {
+  on(ev: 'trade', fn: (symbol: string, t: Trade, eventTime: number, recvLocal: number) => void): this;
+  on(ev: 'ticker', fn: (symbol: string, t: Ticker, eventTime: number, recvLocal: number) => void): this;
+  on(ev: 'connected', fn: (symbols: string[], at: number) => void): this;
+  on(ev: 'disconnected', fn: (reason: string, symbols: string[]) => void): this;
+}
+
+/**
+ * 现货 + 合约两条连接的组合，接口与单个 BinanceHub 相同：按市场键后缀路由，事件原样转发。
+ * 两条连接独立重连；一条断线只作废该市场的窗口（disconnected 事件带受影响的市场键）。
+ */
+export class MarketHub extends EventEmitter {
+  readonly hubs: Record<Product, BinanceHub>;
+
+  constructor(spotUrl: string, futuresUrl: string) {
+    super();
+    this.hubs = { spot: new BinanceHub(spotUrl, 'spot'), futures: new BinanceHub(futuresUrl, 'futures') };
+    for (const h of Object.values(this.hubs)) {
+      for (const ev of ['trade', 'ticker', 'connected', 'disconnected']) (h as EventEmitter).on(ev, (...a: unknown[]) => this.emit(ev, ...a));
+    }
+  }
+
+  private of(key: string) {
+    return this.hubs[parseMarketKey(key).product];
+  }
+
+  start(keys: string[]) {
+    for (const [p, h] of Object.entries(this.hubs)) h.start(keys.filter((k) => parseMarketKey(k).product === p));
+  }
+  stop() {
+    for (const h of Object.values(this.hubs)) h.stop();
+  }
+  ensure(key: string) {
+    this.of(key).ensure(key);
+  }
+  release(key: string) {
+    this.of(key).release(key);
+  }
+  samples(key: string, stream: StreamName = 'aggTrade') {
+    return this.of(key).samples(key, stream);
+  }
+
+  /** 顶层字段沿用现货连接（兼容旧页面），每个市场的连接状态见 connections */
+  getStatus(): HubStatus & { connections: Omit<HubStatus, 'streams'>[] } {
+    const all = Object.values(this.hubs).map((h) => h.getStatus());
+    return {
+      ...all[0],
+      streams: all.flatMap((h) => h.streams),
+      connections: all.map(({ streams: _s, ...rest }) => rest),
+    };
   }
 }
