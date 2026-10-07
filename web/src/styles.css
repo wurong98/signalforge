@@ -212,3 +212,5 @@ label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color:
   .huge { font-size: 28px; }
   .delivery { grid-template-columns: 90px 40px 40px 60px 1fr; }
 }
+
+.symbol-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 4px 12px; margin-top: 12px; max-height: 480px; overflow-y: auto; }
