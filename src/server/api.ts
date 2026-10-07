@@ -7,7 +7,10 @@ import type { BinanceHub } from './binance/stream.ts';
 import { config } from './config.ts';
 import type { Db } from './db.ts';
 import type { Runtime } from './engine/runtime.ts';
+import { runChat } from './nl/chat.ts';
+import { llmCaller } from './nl/llm.ts';
 import { parseNaturalLanguage } from './nl/parse.ts';
+import { safeTz } from './nl/tools.ts';
 import type { WebhookDispatcher } from './webhook/delivery.ts';
 
 const RANGES: Record<string, number> = { '1m': 60_000, '5m': 300_000, '15m': 900_000, '1h': 3_600_000 };
@@ -71,6 +74,35 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
     const out = await parseNaturalLanguage(body.data.text, config.llm);
     if ('error' in out) return bad(reply, [out.error, ...out.warnings], 422);
     return out;
+  });
+
+  // ---------- 助手（行情询问，只读；docs/llm-assistant-plan.md） ----------
+  const ChatBody = z.object({
+    messages: z
+      .array(z.object({ role: z.enum(['user', 'assistant']), content: z.string().max(8_000), digest: z.string().max(2_000).optional() }))
+      .min(1)
+      .max(40),
+    tz: z.string().max(64).optional(),
+  });
+  // 每次对话最多 7 次 LLM 调用，限制并发避免把额度打满
+  let chatInFlight = 0;
+  app.post('/api/chat', async (req, reply) => {
+    if (!config.llm) return bad(reply, '未配置 LLM（LLM_BASE_URL / LLM_API_KEY），助手不可用；创建 Signal 请用 Create 页（规则解析）', 503);
+    const body = ChatBody.safeParse(req.body);
+    if (!body.success) return bad(reply, '消息格式不正确');
+    if (chatInFlight >= 2) return bad(reply, '助手正忙，请稍后再试', 429);
+    chatInFlight++;
+    try {
+      return await runChat(body.data.messages, {
+        call: llmCaller(config.llm),
+        tools: { runtime, db, retentionDays: config.metricRetentionDays, now: Date.now, tz: safeTz(body.data.tz) },
+        signal: AbortSignal.timeout(90_000),
+      });
+    } catch (e) {
+      return bad(reply, `助手调用失败：${(e as Error).message}`, 502);
+    } finally {
+      chatInFlight--;
+    }
   });
 
   app.post('/api/preview', async (req, reply) => {
