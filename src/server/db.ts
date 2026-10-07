@@ -83,6 +83,9 @@ export class Db {
       );
       CREATE INDEX IF NOT EXISTS deliveries_webhook_ts ON deliveries(webhook_id, ts DESC);
       CREATE INDEX IF NOT EXISTS deliveries_event ON deliveries(event_id);
+      -- 助手按时间范围跨 Signal 查询（docs/llm-assistant-plan.md §3.2）
+      CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
+      CREATE INDEX IF NOT EXISTS deliveries_ts ON deliveries(ts);
       CREATE TABLE IF NOT EXISTS metric_points (
         symbol TEXT NOT NULL, metric TEXT NOT NULL, ts INTEGER NOT NULL, value REAL,
         PRIMARY KEY (symbol, metric, ts)
@@ -178,6 +181,35 @@ export class Db {
         : this.raw.prepare('SELECT * FROM events WHERE signal_id = ? ORDER BY id DESC LIMIT ?').all(signalId, limit);
     return rows.map((r) => this.toEvent(r));
   }
+  /** 时间范围内的事件（新→旧），助手 list_events 用 */
+  listEventsBetween(from: number, to: number, signalId: number | null, limit: number): EventRow[] {
+    const rows =
+      signalId === null
+        ? this.raw.prepare('SELECT * FROM events WHERE ts BETWEEN ? AND ? ORDER BY ts DESC LIMIT ?').all(from, to, limit)
+        : this.raw.prepare('SELECT * FROM events WHERE signal_id = ? AND ts BETWEEN ? AND ? ORDER BY ts DESC LIMIT ?').all(signalId, from, to, limit);
+    return rows.map((r) => this.toEvent(r));
+  }
+  /** 按 Signal 聚合触发次数；标题取范围内最新一次触发时的快照（Signal 可能已被删除或改名） */
+  eventCounts(from: number, to: number, signalId: number | null) {
+    return this.raw
+      .prepare(
+        `SELECT signal_id, COUNT(*) AS n, MIN(ts) AS first_ts, MAX(ts) AS last_ts,
+                (SELECT json_extract(e2.spec, '$.title') FROM events e2 WHERE e2.signal_id = e.signal_id AND e2.ts BETWEEN ? AND ?
+                 ORDER BY e2.ts DESC LIMIT 1) AS title,
+                MAX(symbol) AS symbol
+         FROM events e WHERE ts BETWEEN ? AND ? AND (? IS NULL OR signal_id = ?)
+         GROUP BY signal_id ORDER BY n DESC`,
+      )
+      .all(from, to, from, to, signalId, signalId) as { signal_id: number; n: number; first_ts: number; last_ts: number; title: string | null; symbol: string }[];
+  }
+  /** 范围内事件时间戳（分时段统计在调用方按用户时区分桶） */
+  eventTimestamps(from: number, to: number, signalId: number | null, limit: number): number[] {
+    return (
+      this.raw
+        .prepare('SELECT ts FROM events WHERE ts BETWEEN ? AND ? AND (? IS NULL OR signal_id = ?) ORDER BY ts LIMIT ?')
+        .all(from, to, signalId, signalId, limit) as { ts: number }[]
+    ).map((r) => r.ts);
+  }
   getEvent(id: number): EventRow | undefined {
     const r = this.raw.prepare('SELECT * FROM events WHERE id = ?').get(id);
     return r ? this.toEvent(r) : undefined;
@@ -205,6 +237,26 @@ export class Db {
         ? this.raw.prepare('SELECT * FROM deliveries WHERE event_id = ? ORDER BY id').all(opts.eventId)
         : this.raw.prepare('SELECT * FROM deliveries WHERE webhook_id = ? ORDER BY id DESC LIMIT ?').all(opts.webhookId ?? -1, limit);
     return rows.map((r) => this.toDelivery(r));
+  }
+  /** 时间范围内失败的投递；只取白名单字段，不带 webhook 的 url / headers / secret */
+  failedDeliveriesBetween(from: number, to: number, limit: number) {
+    return this.raw
+      .prepare(
+        `SELECT d.ts, d.event_id, d.webhook_id, w.name AS webhook_name, d.attempt, d.http_status, d.error, d.is_test
+         FROM deliveries d LEFT JOIN webhooks w ON w.id = d.webhook_id
+         WHERE d.ok = 0 AND d.ts BETWEEN ? AND ? ORDER BY d.ts DESC LIMIT ?`,
+      )
+      .all(from, to, limit)
+      .map((r: any) => ({ ...r, is_test: !!r.is_test })) as {
+      ts: number;
+      event_id: number | null;
+      webhook_id: number;
+      webhook_name: string | null;
+      attempt: number;
+      http_status: number | null;
+      error: string | null;
+      is_test: boolean;
+    }[];
   }
   webhookStats(webhookId: number) {
     return this.raw
@@ -243,6 +295,23 @@ export class Db {
          WHERE symbol = ? AND metric = ? AND ts BETWEEN ? AND ? GROUP BY ts / ? ORDER BY ts`,
       )
       .all(stepMs, stepMs, symbol, metric, from, to, stepMs) as { ts: number; value: number | null }[];
+  }
+  /** 指标采样在时间范围内的统计（助手 metric_stats 用，避免把点列整段读进内存） */
+  metricStats(symbol: string, metric: string, from: number, to: number) {
+    const agg = this.raw
+      .prepare(
+        `SELECT COUNT(*) AS points, COUNT(value) AS valued, MIN(value) AS min, MAX(value) AS max, AVG(value) AS avg,
+                MIN(ts) AS first_ts, MAX(ts) AS last_ts
+         FROM metric_points WHERE symbol = ? AND metric = ? AND ts BETWEEN ? AND ?`,
+      )
+      .get(symbol, metric, from, to) as {
+      points: number; valued: number; min: number | null; max: number | null; avg: number | null; first_ts: number | null; last_ts: number | null;
+    };
+    const pick = (order: string) =>
+      (this.raw
+        .prepare(`SELECT ts, value FROM metric_points WHERE symbol = ? AND metric = ? AND ts BETWEEN ? AND ? AND value IS NOT NULL ORDER BY ${order} LIMIT 1`)
+        .get(symbol, metric, from, to) as { ts: number; value: number } | undefined) ?? null;
+    return { ...agg, first: pick('ts'), last: pick('ts DESC'), min_at: pick('value, ts'), max_at: pick('value DESC, ts') };
   }
   pruneMetricPoints(before: number) {
     this.raw.prepare('DELETE FROM metric_points WHERE ts < ?').run(before);

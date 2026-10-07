@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { BrowserRouter, NavLink, Route, Routes } from 'react-router-dom';
 import { type ServerBuild, checkBuilds, formatBuild } from '../../src/shared/build.ts';
 import { LiveContext, UNAUTHORIZED_EVENT, WEB_BUILD, api, fmtAgo, fmtDateTime, useLive, useLiveSource, useNow } from './lib.ts';
+import { AssistantPage } from './pages/Assistant.tsx';
 import { CreatePage } from './pages/Create.tsx';
 import { DataSourcesPage } from './pages/DataSources.tsx';
 import { ExplorePage } from './pages/Explore.tsx';
@@ -131,6 +132,7 @@ function App({ onLogout }: { onLogout: () => void }) {
           </NavLink>
           <nav>
             <NavLink to="/" end>Create</NavLink>
+            <NavLink to="/assistant">Assistant</NavLink>
             <NavLink to="/signals">Signals</NavLink>
             <NavLink to="/explore">Explore</NavLink>
             <NavLink to="/webhooks">Webhooks</NavLink>
@@ -143,6 +145,7 @@ function App({ onLogout }: { onLogout: () => void }) {
         <main>
           <Routes>
             <Route path="/" element={<CreatePage />} />
+            <Route path="/assistant" element={<AssistantPage />} />
             <Route path="/signals" element={<SignalsPage />} />
             <Route path="/signals/:id" element={<SignalDetailPage />} />
             <Route path="/explore" element={<ExplorePage />} />

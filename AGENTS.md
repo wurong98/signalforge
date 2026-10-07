@@ -22,7 +22,7 @@ Binance Signal Studio：自然语言 → Signal DSL → 确定性 Runtime（Bina
 
 ## 架构不变量（改代码前必读）
 
-1. **LLM 不参与实时路径**。`src/server/nl/` 只产出 DSL；`src/server/engine/` 不得 import 任何 LLM 相关代码。
+1. **LLM 不参与实时路径**。`src/server/nl/` 只产出 DSL 或只读问答；`src/server/engine/` 不得 import 任何 LLM 相关代码。
 2. **DSL 是唯一契约**。`src/shared/dsl.ts` 同时被前端、后端、LLM 提示词使用。修改 DSL 时同步更新：
    - `validateSpec()` 语义校验
    - `describeFormula()` / `describeCondition()`（Explain 与透明性依赖它们）
@@ -41,6 +41,7 @@ Binance Signal Studio：自然语言 → Signal DSL → 确定性 Runtime（Bina
    - 断线时 ticker 快照随窗口一起作废（`markDisconnected()` 清空），重连后同样要等第一条新 ticker。旧快照不含断线期间的行情，拿它判就绪会把"断线期间已满足"的条件当成边沿触发，旧极值还会导致误报新低/新高；
    - 创新低/新高用**严格**不等号（`last_1s < low_24h`）。成交价"等于"极值只是恰好停在那儿；用 `<=` 会让条件在整段下跌中持续为真，整个过程只在第一次反弹时触发一次，限频就完全失效了。代价是：若某次 ticker 比 aggTrade 先到、已经包含了这笔新极值，这次会漏报（只会漏、不会误报，下一次创新低照常触发）。
 10. **所有 `/api/*` 必须经过管理密码鉴权**（`src/server/auth.ts` 的 onRequest 钩子，须先于业务路由注册），仅 `/api/auth/{status,login,setup}` 例外。新增接口不得绕过；未设置密码时同样拦截。密码哈希在 `ADMIN_FILE`（默认 `data/admin.json`），删除即重置。
+11. **助手（`src/server/nl/chat.ts`）只读**。工具（`nl/tools.ts`）只能调用 Runtime / Db 的只读方法，不得写库、不得启停或保存 Signal；建/改 Signal 只产出提案，保存必须由用户在界面确认后走 `/api/signals`。工具输出按字段白名单构造，不得包含 webhook url / headers / secret；指标值为 null 时原样返回（不变量 4）；指标历史超出 `METRIC_RETENTION_DAYS` 的区间直接拒答，不用部分数据回答。思考模式按用途分开：生成 DSL 开，对话工具循环关（带工具开思考须逐轮回传 `reasoning_content`）。方案见 `docs/llm-assistant-plan.md`。
 
 ## 代码地图
 
@@ -59,9 +60,12 @@ src/server/engine/window.ts  增量滑动窗口累加器 + 24h ticker 快照
 src/server/engine/signal.ts  条件求值 + 状态机
 src/server/engine/runtime.ts 编排、采样、事件、派发
 src/server/webhook/delivery.ts  签名 / 重试 / SSRF
+src/server/nl/llm.ts         OpenAI 兼容调用（DeepSeek thinking 开关、tools）
 src/server/nl/parse.ts       LLM 解析 + 校验修复循环
+src/server/nl/tools.ts       助手只读工具（行情 / Signal / 事件 / 投递）
+src/server/nl/chat.ts        助手对话循环（/api/chat）
 src/server/nl/rules.ts       规则解析兜底 + 噪声下限 + 24h 档
-web/src/                     React 前端（lib.ts 为 API/类型/格式化）
+web/src/                     React 前端（lib.ts 为 API/类型/格式化；pages/Assistant.tsx 为助手页）
 test/                        单元测试
 docs/                        PRD 评审、交接文档
 ```

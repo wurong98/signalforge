@@ -5,14 +5,11 @@
  */
 import { CATALOG } from '../../shared/catalog.ts';
 import { AGGREGATIONS, COMBINE_OPS, FIELDS, OPERATORS, TICKER_FIELDS, WINDOWS, validateSpec } from '../../shared/dsl.ts';
+import type { LlmConfig, LlmMessage } from './llm.ts';
+import { llmCaller, stripThink } from './llm.ts';
 import type { ParseOutput } from './rules.ts';
 import { parseWithRules } from './rules.ts';
 
-export interface LlmConfig {
-  baseUrl: string;
-  apiKey: string;
-  model: string;
-}
 
 const MAX_WINDOW = WINDOWS[WINDOWS.length - 1];
 
@@ -113,23 +110,9 @@ Reply with ONLY a JSON object, no markdown:
 { "spec": Spec, "explanation": string /* in the user's language: what raw data, which formula, when it fires */,
   "assumptions": string[] /* in the user's language */, "unsupported": string | null }`;
 
-async function callLlm(cfg: LlmConfig, messages: { role: string; content: string }[]): Promise<string> {
-  const res = await fetch(`${cfg.baseUrl.replace(/\/$/, '')}/chat/completions`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${cfg.apiKey}` },
-    body: JSON.stringify({ model: cfg.model, messages, temperature: 0.1 }),
-    signal: AbortSignal.timeout(60_000),
-  });
-  if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
-  const data: any = await res.json();
-  const content = data?.choices?.[0]?.message?.content;
-  if (typeof content !== 'string') throw new Error('LLM returned no content');
-  return content;
-}
-
 /** 去掉推理模型的 <think> 块与代码围栏，截取最外层 JSON */
 export function extractJson(text: string): unknown {
-  const cleaned = text.replace(/<think>[\s\S]*?<\/think>/g, '').replace(/```(?:json)?/g, '');
+  const cleaned = stripThink(text).replace(/```(?:json)?/g, '');
   const start = cleaned.indexOf('{');
   const end = cleaned.lastIndexOf('}');
   if (start < 0 || end <= start) throw new Error('no JSON object in LLM output');
@@ -142,14 +125,16 @@ export async function parseNaturalLanguage(
 ): Promise<(ParseOutput & { warnings: string[] }) | { error: string; warnings: string[] }> {
   const warnings: string[] = [];
   if (cfg) {
-    const messages = [
+    const call = llmCaller(cfg);
+    const messages: LlmMessage[] = [
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: text },
     ];
     for (let round = 0; round < 2; round++) {
       let raw: string;
       try {
-        raw = await callLlm(cfg, messages);
+        // 生成 DSL 开启思考：单次调用、不带工具，reasoning_content 不必回传
+        raw = (await call(messages, { thinking: true, temperature: 0.1 })).content ?? '';
       } catch (e) {
         warnings.push(`LLM 调用失败，已回落到规则解析：${(e as Error).message}`);
         break;
