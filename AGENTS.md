@@ -30,13 +30,13 @@ Binance Signal Studio：自然语言 → Signal DSL → 确定性 Runtime（Bina
    - `src/server/nl/rules.ts` 规则解析器
    - 已存库的 spec 是 JSON，改动须向后兼容或提供迁移
 3. **窗口基于交易所成交时间 T**，不是本地时间。`SymbolWindows.advance()` 必须单调。
-4. **窗口未就绪返回 null，不返回 0**。启动/重连后连续接收时长 < 窗口长度时，Signal 处于 `WARMING`，不得触发。
+4. **窗口未就绪返回 null，不返回 0**。启动/重连后连续接收时长 < 窗口长度时，Signal 处于 `WARMING`，不得触发。连续接收从**订阅生效**起算（连接建立 / SUBSCRIBE 确认，hub 的 `connected` 事件），不是从第一笔成交起算：连接不断时没有成交就是确实没有成交，冷门合约 5 分钟无成交应得 0，不能一直 WARMING。
 5. **只在边沿触发**。状态机见 `src/server/engine/signal.ts` 顶部注释；启动时已满足的条件不触发。改状态机必须同步改 `test/engine.test.ts` 中的状态机用例。
 6. **事件自包含**。`events` 表保存触发时的 `spec` 快照与每个叶子条件的左右值；Explain 只读快照，不读当前 Signal 定义。
 7. **Webhook 安全**：默认拒绝私有地址、不跟随重定向。不要为了方便测试去掉这些检查——用 `ALLOW_PRIVATE_WEBHOOKS=true`。
 8. 事件与投递日志**永久保留**，删除 Signal 不删它们。
 9. **长周期需求走 `kind:"ticker"`，不得退化成窗口近似**。aggTrade 窗口上限 5m（`WINDOWS` 末项；窗口时长一律经 `windowMs()` 换算，窗口名可带 s/m/h 后缀，禁止自行 `slice` 按秒解析），"24 小时新低"这类语义只能由 `<symbol>@ticker`（交易所侧维护的 24h 滚动统计，每秒下发、无预热）表达。两个配套约束：
-   - ticker **不参与**成交窗口的时钟与预热（`nowEx` / `continuousSince` 仍只由 aggTrade 驱动），只更新快照；
+   - ticker **不参与**成交窗口的时钟与预热（`nowEx` 只由 aggTrade 校准，`continuousSince` 只由订阅生效 / 断线决定），只更新快照；
    - 用到 ticker 的 Signal 必须等到**第一条 ticker 到达**才算就绪（`requiresTicker()`）。否则就绪瞬间 ticker 还是 null（条件假 → ARMED），下一秒 ticker 到达、条件转真，会被误判成边沿而触发，直接破坏不变量 5；
    - 断线时 ticker 快照随窗口一起作废（`markDisconnected()` 清空），重连后同样要等第一条新 ticker。旧快照不含断线期间的行情，拿它判就绪会把"断线期间已满足"的条件当成边沿触发，旧极值还会导致误报新低/新高；
    - 创新低/新高用**严格**不等号（`last_1s < low_24h`）。成交价"等于"极值只是恰好停在那儿；用 `<=` 会让条件在整段下跌中持续为真，整个过程只在第一次反弹时触发一次，限频就完全失效了。代价是：若某次 ticker 比 aggTrade 先到、已经包含了这笔新极值，这次会漏报（只会漏、不会误报，下一次创新低照常触发）。
@@ -48,6 +48,7 @@ Binance Signal Studio：自然语言 → Signal DSL → 确定性 Runtime（Bina
     - 合约连接按需建立，无合约 Signal 时不连接（空连接会被假死检测反复重连）；
     - 合约 WS 必须走 `/market` 路由（`wss://fstream.binance.com/market`），2026-04-23 起无路由旧地址下线，aggTrade / ticker 不在 `/public`；
     - 只支持永续（`PERPETUAL` / `TRADIFI_PERPETUAL`）；交割合约会到期换代，币本位不支持。
+    - 合约连接始终带上全局流 `tradingSession` 作保活，不要去掉。冷门合约成交可能间隔 30s 以上（ticker 也只在变化时推），连接上只有这类合约时会被假死检测反复重连、作废窗口，永远预热不完；这条流每秒推送、标的休市也不断。它的 `NO_TRADING` 指**标的**休市，TradFi 永续本身 7×24 交易，不得据此判定"无成交"或改变就绪逻辑。市场名 = 报文 `e` 去掉 `Update` 后转大写（`CN_EquityUpdate` → `CN_EQUITY`），与 exchangeInfo 的 `underlyingType` 对应。
 
 ## 代码地图
 

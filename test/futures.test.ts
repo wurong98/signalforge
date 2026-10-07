@@ -5,8 +5,10 @@ import { BinanceHub, MarketHub } from '../src/server/binance/stream.ts';
 import { Db } from '../src/server/db.ts';
 import { Runtime } from '../src/server/engine/runtime.ts';
 import type { SymbolWindows } from '../src/server/engine/window.ts';
+import { CATALOG_BY_NAME } from '../src/shared/catalog.ts';
 import { detectProduct, parseWithRules } from '../src/server/nl/rules.ts';
 import type { WebhookDispatcher } from '../src/server/webhook/delivery.ts';
+import type { WindowMetric } from '../src/shared/dsl.ts';
 import { marketKey, parseMarketKey, validateSpec } from '../src/shared/dsl.ts';
 
 test('dsl: product 支持 futures，旧 spot spec 不变；市场键 .P 往返', () => {
@@ -54,6 +56,22 @@ test('stream: 合约连接把交易所 symbol 转成 .P 市场键；流名不带
   assert.equal(hub.getStatus().product, 'futures');
 });
 
+test('stream: tradingSession 记录各 TradFi 市场时段，并算作连接活跃（不触发假死重连）', () => {
+  const hub = new BinanceHub('wss://x', 'futures');
+  (hub as any).addState('UNITREEUSDT.P');
+  (hub as any).lastMessageLocal = 0;
+  // 字段取自官方 SDK（binance-connector-js TradingSessionStreamResponse）与 /fapi/v1/tradingSchedule 实际返回
+  (hub as any).onMessage(JSON.stringify({ stream: 'tradingSession', data: { e: 'CN_EquityUpdate', E: 1790652601000, t: 1790652600000, T: 1790658000000, S: 'NO_TRADING' } }));
+  (hub as any).onMessage(JSON.stringify({ stream: 'tradingSession', data: { e: 'EquityUpdate', E: 1790652601000, t: 1790640000000, T: 1790668800000, S: 'OVERNIGHT' } }));
+  (hub as any).onMessage(JSON.stringify({ stream: 'tradingSession', data: { e: 'CN_EquityUpdate', E: 1790658001000, t: 1790658000000, T: 1790665020000, S: 'REGULAR' } }));
+  assert.ok((hub as any).lastMessageLocal > 0);
+  const st = hub.getStatus();
+  assert.deepEqual(st.sessions?.map((s) => [s.market, s.type]), [['CN_EQUITY', 'REGULAR'], ['EQUITY', 'OVERNIGHT']]);
+  // 不是交易对流：不计入任何流的统计，也不算畸形报文
+  assert.ok(st.streams.every((s) => s.messages_total === 0 && s.malformed_total === 0));
+  assert.equal(new BinanceHub('wss://x', 'spot').getStatus().sessions, undefined);
+});
+
 test('stream: 无订阅时不建立连接（合约按需连接，避免空连接被假死检测反复重连）', () => {
   const hub = new MarketHub('wss://spot.invalid', 'wss://fut.invalid');
   const orig = globalThis.WebSocket;
@@ -73,7 +91,8 @@ test('stream: 无订阅时不建立连接（合约按需连接，避免空连接
     assert.match(opened[0], /^wss:\/\/spot\.invalid\/stream\?streams=btcusdt@aggTrade\/btcusdt@ticker$/);
     hub.ensure('ETHUSDT.P');
     assert.equal(opened.length, 2);
-    assert.match(opened[1], /^wss:\/\/fut\.invalid\/stream\?streams=ethusdt@aggTrade\/ethusdt@ticker$/);
+    // 合约连接带上全局 tradingSession 保活：冷门合约成交稀疏时不会因无消息被假死检测反复重连；现货不订阅
+    assert.match(opened[1], /^wss:\/\/fut\.invalid\/stream\?streams=ethusdt@aggTrade\/ethusdt@ticker\/tradingSession$/);
     hub.release('ETHUSDT.P');
     assert.equal(hub.hubs.futures.getStatus().status, 'disconnected');
   } finally {
@@ -98,4 +117,64 @@ test('runtime: 一个市场断线只作废该市场的窗口，同名另一市�
   hub.emit('disconnected', 'closed', ['BTCUSDT.P']);
   assert.ok(win('BTCUSDT').ready(5_000));
   assert.ok(!win('BTCUSDT.P').ready(5_000));
+});
+
+test('runtime: 预热从订阅生效起算，连接不断 5 分钟无成交 → 成交额为 0 而不是一直 WARMING（冷门合约）', () => {
+  const hub = Object.assign(new EventEmitter(), { start() {}, stop() {}, ensure() {}, release() {} });
+  const rt = new Runtime(new Db(':memory:'), hub as any, {} as WebhookDispatcher, ['UNITREEUSDT.P'], 7);
+  rt.sync();
+  const w = (rt as any).windows.get('UNITREEUSDT.P') as SymbolWindows;
+  const m = CATALOG_BY_NAME.get('buy_notional_5m') as WindowMetric;
+  const at = 1_791_389_000_000;
+  hub.emit('connected', ['UNITREEUSDT.P'], at);
+  // 本地时间估算交易所时间，起点后推 1s：差 1s 时仍未就绪，宁晚不早
+  w.advance(at + 300_000);
+  assert.equal(w.window(m), null);
+  w.advance(at + 301_000);
+  assert.equal(w.window(m), 0);
+  // 断线作废，重连后重新起算
+  hub.emit('disconnected', 'closed', ['UNITREEUSDT.P']);
+  assert.equal(w.window(m), null);
+  hub.emit('connected', ['UNITREEUSDT.P'], at + 400_000);
+  w.advance(at + 701_000);
+  assert.equal(w.window(m), 0);
+});
+
+test('stream: 连接中途加入的交易对 onopen 补订阅，SUBSCRIBE 确认后才算生效；失败不算', () => {
+  const orig = globalThis.WebSocket;
+  let ws: any;
+  globalThis.WebSocket = class {
+    static OPEN = 1;
+    readyState = 0;
+    sent: any[] = [];
+    onopen?: () => void;
+    constructor(public url: string) {
+      ws = this;
+    }
+    close() {}
+    send(x: string) {
+      this.sent.push(JSON.parse(x));
+    }
+  } as any;
+  const hub = new BinanceHub('wss://fut.invalid', 'futures');
+  const live: string[][] = [];
+  hub.on('connected', (s) => live.push(s));
+  try {
+    hub.start(['BTCUSDT.P']);
+    hub.ensure('UNITREEUSDT.P'); // 连接中：URL 已拼好，不含它
+    assert.doesNotMatch(ws.url, /unitree/);
+    ws.readyState = 1;
+    ws.onopen();
+    assert.deepEqual(live, [['BTCUSDT.P']]);
+    const sub = ws.sent[0];
+    assert.deepEqual(sub.params, ['unitreeusdt@aggTrade', 'unitreeusdt@ticker']);
+    (hub as any).onMessage(JSON.stringify({ result: null, id: sub.id }));
+    assert.deepEqual(live, [['BTCUSDT.P'], ['UNITREEUSDT.P']]);
+    hub.ensure('XAUUSDT.P');
+    (hub as any).onMessage(JSON.stringify({ error: { code: 2, msg: 'Invalid request' }, id: ws.sent[1].id }));
+    assert.equal(live.length, 2);
+  } finally {
+    hub.stop();
+    globalThis.WebSocket = orig;
+  }
 });
