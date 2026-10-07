@@ -8,6 +8,8 @@ export class ApiError extends Error {
   }
 }
 
+export const UNAUTHORIZED_EVENT = 'sf:unauthorized';
+
 export async function api<T = any>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
   const res = await fetch(`/api${path}`, {
     method: init?.method ?? (init?.body !== undefined ? 'POST' : 'GET'),
@@ -15,6 +17,8 @@ export async function api<T = any>(path: string, init?: { method?: string; body?
     body: init?.body !== undefined ? JSON.stringify(init.body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
+  // 会话失效（过期 / 密码文件被删除重设）：通知 AuthGate 回到登录框
+  if (res.status === 401 && !path.startsWith('/auth/')) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
   if (!res.ok) throw new ApiError(data.errors ?? [`HTTP ${res.status}`]);
   return data;
 }
@@ -132,7 +136,14 @@ export function useLiveSource(): LiveState {
       setState((s) => ({ ...s, tick, connected: true, skew: tick.server_time - Date.now() }));
     });
     es.addEventListener('signal_event', () => setState((s) => ({ ...s, eventSeq: s.eventSeq + 1 })));
-    es.onerror = () => setState((s) => ({ ...s, connected: false }));
+    es.onerror = () => {
+      setState((s) => ({ ...s, connected: false }));
+      // 401 等非 200 响应会让 EventSource 永久关闭而不重连，此时确认一下是否是会话失效
+      if (es.readyState === EventSource.CLOSED)
+        api<{ authenticated: boolean }>('/auth/status')
+          .then((r) => !r.authenticated && window.dispatchEvent(new Event(UNAUTHORIZED_EVENT)))
+          .catch(() => {});
+    };
     return () => es.close();
   }, []);
   return state;

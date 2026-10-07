@@ -1,7 +1,7 @@
-import { StrictMode } from 'react';
+import { type FormEvent, StrictMode, useCallback, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter, NavLink, Route, Routes } from 'react-router-dom';
-import { LiveContext, fmtAgo, useLive, useLiveSource, useNow } from './lib.ts';
+import { LiveContext, UNAUTHORIZED_EVENT, api, fmtAgo, useLive, useLiveSource, useNow } from './lib.ts';
 import { CreatePage } from './pages/Create.tsx';
 import { DataSourcesPage } from './pages/DataSources.tsx';
 import { ExplorePage } from './pages/Explore.tsx';
@@ -33,7 +33,73 @@ function LiveStatus() {
   );
 }
 
-function App() {
+/** 首次打开设置管理密码 / 之后输入管理密码；未通过前不渲染任何业务页面，也不建立 SSE */
+function AuthScreen({ configured, onDone }: { configured: boolean; onDone: () => void }) {
+  const [password, setPassword] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!configured && password !== confirm) return setError('两次输入的密码不一致');
+    setBusy(true);
+    setError('');
+    try {
+      await api(configured ? '/auth/login' : '/auth/setup', { body: { password } });
+      onDone();
+    } catch (err) {
+      setError((err as Error).message);
+      // 别人抢先完成了设置：切到登录
+      if (!configured) onDone();
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="auth-wrap">
+      <form className="card auth-card" onSubmit={submit}>
+        <div className="big">{configured ? '输入管理密码' : '设置管理密码'}</div>
+        <div className="muted small">
+          {configured
+            ? '忘记密码：删除服务器上的 data/admin.json（ADMIN_FILE）后刷新页面即可重新设置。'
+            : '首次使用，请设置管理密码（至少 8 位）。之后所有访问都需要输入它。'}
+        </div>
+        <label>
+          密码
+          <input type="password" autoFocus autoComplete={configured ? 'current-password' : 'new-password'} value={password} onChange={(e) => setPassword(e.target.value)} />
+        </label>
+        {!configured && (
+          <label>
+            确认密码
+            <input type="password" autoComplete="new-password" value={confirm} onChange={(e) => setConfirm(e.target.value)} />
+          </label>
+        )}
+        {error && <div className="alert bad">{error}</div>}
+        <button className="primary" disabled={busy || !password}>{configured ? '登录' : '设置并进入'}</button>
+      </form>
+    </div>
+  );
+}
+
+function AuthGate() {
+  const [auth, setAuth] = useState<{ configured: boolean; authenticated: boolean } | null>(null);
+  const refresh = useCallback(() => {
+    api<{ configured: boolean; authenticated: boolean }>('/auth/status')
+      .then(setAuth)
+      .catch(() => setAuth({ configured: true, authenticated: false }));
+  }, []);
+  useEffect(() => {
+    refresh();
+    window.addEventListener(UNAUTHORIZED_EVENT, refresh);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, refresh);
+  }, [refresh]);
+  if (!auth) return null;
+  if (!auth.authenticated) return <AuthScreen configured={auth.configured} onDone={refresh} />;
+  const logout = () => api('/auth/logout', { body: {} }).finally(refresh);
+  return <App onLogout={logout} />;
+}
+
+function App({ onLogout }: { onLogout: () => void }) {
   const live = useLiveSource();
   return (
     <LiveContext.Provider value={live}>
@@ -54,6 +120,7 @@ function App() {
             <NavLink to="/data-sources" className="secondary">Data Sources</NavLink>
           </nav>
           <LiveStatus />
+          <button className="ghost small logout" onClick={onLogout}>退出</button>
         </header>
         <main>
           <Routes>
@@ -72,6 +139,6 @@ function App() {
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <App />
+    <AuthGate />
   </StrictMode>,
 );
