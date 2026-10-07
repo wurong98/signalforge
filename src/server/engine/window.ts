@@ -9,10 +9,12 @@
  * - 就绪性：连接连续接收时长 ≥ 窗口长度，窗口才被认为是完整的，
  *   否则值为 null，避免启动/重连后用残缺窗口误触发。
  * - ticker 指标不走这套累加：24h 统计由交易所算好后每秒下发，收到第一条即可用，
- *   既不受 60s 窗口上限约束，也不需要预热。
+ *   既不受窗口上限（5m）约束，也不需要预热。
  */
 import type { MetricDef, TickerMetric, WindowMetric } from '../../shared/dsl.ts';
-import { windowMs } from '../../shared/dsl.ts';
+import { WINDOWS, windowMs } from '../../shared/dsl.ts';
+
+const MAX_WINDOW_MS = Math.max(...WINDOWS.map(windowMs));
 
 export interface Trade {
   /** aggTrade id */
@@ -76,7 +78,12 @@ export class SymbolWindows {
   /** buf[0] 对应的绝对下标 */
   private base = 0;
   private accs = new Map<string, Accumulator>();
-  private maxWindowMs = 60_000;
+  /**
+   * 缓冲区至少保留 DSL 允许的最长窗口：累加器是惰性创建的，新建时只能用缓冲区回填。
+   * 若只保留 60s，晚建的 5m 累加器只回填到 60s 数据，而 ready() 只看连续接收时长，
+   * 会把残缺窗口当成完整窗口（不变量 4）。
+   */
+  private maxWindowMs = MAX_WINDOW_MS;
   /** 当前连续接收区间的起点（交易所时间）；null 表示未连接 */
   private continuousSince: number | null = null;
   /** 最近一条 24h ticker 快照；收到第一条之前所有 ticker 指标为 null */

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { EXPLORE_DEFAULTS } from '../../../src/shared/catalog.ts';
+import { WINDOW_SUFFIX_RE } from '../../../src/shared/dsl.ts';
 import { LineChart } from '../components/LineChart.tsx';
 import { api, fmtNum, useLive } from '../lib.ts';
 
@@ -47,7 +48,7 @@ export function ExplorePage() {
   const groups = useMemo(() => {
     const g = new Map<string, CatalogItem[]>();
     for (const c of catalog) {
-      const k = c.name.replace(/_\d+s$/, '');
+      const k = c.name.replace(WINDOW_SUFFIX_RE, '');
       g.set(k, [...(g.get(k) ?? []), c]);
     }
     return [...g.entries()];
@@ -82,7 +83,7 @@ export function ExplorePage() {
             <span className="picker-label">{base}</span>
             {items.map((c) => (
               <button key={c.name} className={`chip ${selected.includes(c.name) ? 'on' : ''}`} onClick={() => toggle(c.name)} title={c.formula}>
-                {c.window ?? c.name.match(/_(\d+s)$/)?.[1] ?? c.name}
+                {c.window ?? c.name.match(WINDOW_SUFFIX_RE)?.[1] ?? c.name}
               </button>
             ))}
             <span className="muted small">{items[0].description}</span>

@@ -13,7 +13,7 @@ export function firstLeafOp(row: SignalRow) {
 
 export function gaugeLabel(row: SignalRow) {
   const l = firstLeafOp(row);
-  if ('metric' in l.right) return `${l.left.replace(/_notional|_\d+s$/g, '')} / ${l.right.metric.replace(/_notional|_\d+s$/g, '')}`;
+  if ('metric' in l.right) return `${l.left.replace(/_notional|_\d+[smh]$/g, '')} / ${l.right.metric.replace(/_notional|_\d+[smh]$/g, '')}`;
   return l.left;
 }
 
