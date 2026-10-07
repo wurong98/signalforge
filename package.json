@@ -1,6 +1,6 @@
 {
   "name": "signalforge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Binance Signal Studio — 用自然语言，把 Binance 实时数据变成可执行 Signal",
   "type": "module",
