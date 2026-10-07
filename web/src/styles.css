@@ -61,6 +61,7 @@ nav a.secondary { font-size: 12px; }
 .auth-card button { align-self: stretch; }
 
 main { padding: 24px; max-width: 1280px; margin: 0 auto; }
+.build-footer { display: flex; flex-wrap: wrap; gap: 6px 14px; justify-content: center; padding: 16px 24px 24px; color: var(--muted); font-size: 11px; }
 .page { display: flex; flex-direction: column; gap: 16px; }
 .page.narrow { max-width: 880px; margin: 0 auto; }
 .page-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }

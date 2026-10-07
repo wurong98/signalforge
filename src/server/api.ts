@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
+import type { ServerBuild } from '../shared/build.ts';
 import { CATALOG, CATALOG_BY_NAME, catalogDescription } from '../shared/catalog.ts';
 import { SYMBOL_RE, WebhookInputSchema, describeFormula, metricUnit, validateSpec } from '../shared/dsl.ts';
 import type { BinanceHub } from './binance/stream.ts';
@@ -26,7 +27,7 @@ async function checkSymbol(symbol: string): Promise<string | null> {
   }
 }
 
-export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runtime; hub: BinanceHub; dispatcher: WebhookDispatcher }) {
+export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runtime; hub: BinanceHub; dispatcher: WebhookDispatcher; build: ServerBuild }) {
   const { db, runtime, hub, dispatcher } = deps;
   const idParam = (req: any) => Number(req.params.id);
 
@@ -41,6 +42,8 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
     };
   };
   app.get('/api/status', async () => statusPayload());
+  // 需登录：不向未鉴权访问者暴露具体版本
+  app.get('/api/version', async () => deps.build);
 
   app.get('/api/live', (req, reply) => {
     reply.raw.writeHead(200, {

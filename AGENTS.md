@@ -47,8 +47,10 @@ Binance Signal Studio：自然语言 → Signal DSL → 确定性 Runtime（Bina
 ```
 src/shared/dsl.ts            DSL schema(zod) + 校验 + 人类可读描述
 src/shared/catalog.ts        内置指标（Explore / 提示词），含 24h ticker 指标
+src/shared/build.ts          部署版本信息 + 前端构建/服务进程一致性检查（页面底部）
 src/server/index.ts          入口：组装 Db / BinanceHub / Dispatcher / Runtime / Fastify
 src/server/config.ts         环境变量
+src/server/version.ts        读取 git commit / dirty（服务启动与 vite 构建时各读一次）
 src/server/api.ts            REST + SSE（/api/live 每秒推送状态）
 src/server/auth.ts           管理密码（首次设置 / 文件存储）+ 会话 Cookie + 登录限流
 src/server/db.ts             node:sqlite，表：webhooks signals events deliveries metric_points
