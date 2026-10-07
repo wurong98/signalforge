@@ -53,6 +53,10 @@ ticker field mapping: last_price=c, high_24h=h, low_24h=l, change_24h=p, change_
 change_pct_24h is stored as a FRACTION (P = "2.345" => 0.02345), same rule as "return".
 
 Conventions (prefer these names when they fit): ${CATALOG.filter((m) => m.name.endsWith('_10s') || m.name === 'last_price').map((m) => m.name).join(', ')} (same pattern for other windows).
+CVD / volume delta / 主动净买入 => volume_delta_<w> = { kind:"combine", op:"diff", a: buy_notional_<w>, b: sell_notional_<w> }, defined AFTER both
+sums (it is the net aggressive buy notional INSIDE the window — there is no ever-growing cumulative CVD since startup).
+"price up with CVD support" => AND of return_<w> and volume_delta_<w> > 0; "price up but CVD negative" => return_<w> > 0 AND volume_delta_<w> < 0.
+When the user gives no CVD threshold, use 0 and add an assumption that a USDT threshold filters out near-zero flips.
 For "A is N times B", use { left: A, operator: ">", right: { metric: B, multiplier: N } } — NEVER create a ratio metric for this (a ratio is undefined when B = 0).
 Noise floor: a relative comparison (A > B × N) also fires on tiny volume (e.g. $10 buy vs $0 sell). Unless the user gave an absolute
 threshold, wrap it as { op: "and", conditions: [ <the comparison>, { left: A, operator: ">=", right: { value: FLOOR } } ] } where FLOOR is
@@ -93,6 +97,17 @@ Example 2 — input: "BTC 创 24 小时新低时提醒我，每分钟最多一�
 "condition":{"left":"last_1s","operator":"<","right":{"metric":"low_24h","multiplier":1}},"cooldown_ms":60000},
 "explanation":"aggTrade 取最近 1 秒最新成交价，ticker 流（交易所每秒推送）取 24h 最低价；新成交价严格低于 24h 最低价，说明刚刚创下 24 小时新低，ticker 下一秒即刷新到新低，条件随之解除。",
 "assumptions":["每次创新低的边沿触发一次，60 秒冷却内不重复提醒"],"unsupported":null}
+
+Example 3 — input: "XPL 5 分钟涨幅超过 2%，同时 CVD 为正"
+{"spec":{"name":"xpl-pump-cvd-pos-5m","title":"XPL Pump + CVD Positive 5m","description":"XPL 5 分钟涨幅超过 2% 且窗口 CVD 为正",
+"market":{"exchange":"binance","product":"spot","symbol":"XPLUSDT"},
+"metrics":[{"name":"buy_notional_5m","kind":"window","stream":"aggTrade","window":"5m","filter":{"buyer_is_maker":false},"field":"notional","aggregation":"sum"},
+{"name":"sell_notional_5m","kind":"window","stream":"aggTrade","window":"5m","filter":{"buyer_is_maker":true},"field":"notional","aggregation":"sum"},
+{"name":"volume_delta_5m","kind":"combine","op":"diff","a":"buy_notional_5m","b":"sell_notional_5m"},
+{"name":"return_5m","kind":"window","stream":"aggTrade","window":"5m","filter":{},"field":"price","aggregation":"return"}],
+"condition":{"op":"and","conditions":[{"left":"return_5m","operator":">","right":{"value":0.02}},{"left":"volume_delta_5m","operator":">","right":{"value":0}}]},"cooldown_ms":10000},
+"explanation":"基于 XPLUSDT aggTrade：最近 5 分钟价格收益率 (last-first)/first 超过 2%，且同窗口主动买入额 Σ(p×q | m=false) 减主动卖出额 Σ(p×q | m=true)（窗口 CVD）为正时触发。",
+"assumptions":["CVD 按 5 分钟窗口计算，不是从启动起累计的绝对值","CVD 阈值取 0，成交清淡时可能在 0 附近翻转，可改为 USDT 绝对阈值"],"unsupported":null}
 
 Reply with ONLY a JSON object, no markdown:
 { "spec": Spec, "explanation": string /* in the user's language: what raw data, which formula, when it fires */,

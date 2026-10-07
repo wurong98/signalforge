@@ -4,9 +4,21 @@
  */
 import { z } from 'zod';
 
-export const WINDOWS = ['1s', '3s', '5s', '10s', '30s', '60s'] as const;
+export const WINDOWS = ['1s', '3s', '5s', '10s', '30s', '60s', '5m'] as const;
 export type WindowSpec = (typeof WINDOWS)[number];
-export const windowMs = (w: WindowSpec) => Number(w.slice(0, -1)) * 1000;
+const UNIT_MS = { s: 1_000, m: 60_000, h: 3_600_000 } as const;
+/**
+ * 窗口时长换算的唯一入口。窗口名不全是"数字 + s"（5m），
+ * 任何地方都不得自行 slice 解析：曾有多处按秒解析，5m 会被静默当成 5s，
+ * 导致就绪判定提前、窗口值错误（不变量 4）。
+ */
+export const windowMs = (w: string) => {
+  const m = /^(\d+)([smh])$/.exec(w);
+  if (!m) throw new Error(`非法窗口 ${w}`);
+  return Number(m[1]) * UNIT_MS[m[2] as keyof typeof UNIT_MS];
+};
+/** 指标名的窗口后缀，如 buy_notional_10s / volume_delta_5m */
+export const WINDOW_SUFFIX_RE = /_(\d+[smh])$/;
 
 /** aggTrade 上可聚合的字段。notional = p × q */
 export const FIELDS = ['price', 'quantity', 'notional'] as const;
@@ -56,7 +68,7 @@ export const CombineMetricSchema = z.object({
 /**
  * Binance `<symbol>@ticker` 的 24h 滚动统计字段。
  * 与 aggTrade 窗口指标的根本区别：统计由交易所侧维护并每秒推送，
- * 收到的第一条就有效，不需要本地预热，也不受 60s 窗口上限约束。
+ * 收到的第一条就有效，不需要本地预热，也不受 aggTrade 窗口上限约束。
  */
 export const TICKER_FIELDS = [
   /** c：最新成交价 */

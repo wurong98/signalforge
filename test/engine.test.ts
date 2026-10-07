@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { MetricDef, SignalSpec } from '../src/shared/dsl.ts';
-import { describeFormula, metricUnit, validateSpec } from '../src/shared/dsl.ts';
+import { describeFormula, metricUnit, validateSpec, windowMs } from '../src/shared/dsl.ts';
+import { CATALOG, catalogDescription } from '../src/shared/catalog.ts';
 import { SignalStateMachine, evaluateCondition, gauge, requiresTicker, requiredWindowMs } from '../src/server/engine/signal.ts';
 import type { Ticker } from '../src/server/engine/window.ts';
 import { SymbolWindows } from '../src/server/engine/window.ts';
@@ -66,12 +67,13 @@ test('window: many trades with compaction keep running sum exact', () => {
   const w = new SymbolWindows();
   w.markContinuous(0);
   w.evaluate([buy10]);
-  for (let t = 1; t <= 200_000; t++) {
+  for (let t = 1; t <= 500_000; t++) {
     w.push(trade(t, 1, 1, false));
     if (t % 100 === 0) w.advance(t);
   }
   assert.equal(w.evaluate([buy10]).buy, 10_000);
-  assert.ok(w.bufferSize < 80_000);
+  // 缓冲区保留 DSL 最长窗口（5m = 300k 笔 @1笔/ms）+ 一个压缩批次，不会无限增长
+  assert.ok(w.bufferSize <= 300_000 + 1_100, String(w.bufferSize));
 });
 
 test('condition: multiplier form, AND/OR, ratio in explain', () => {
@@ -326,4 +328,72 @@ test('24h new low: reconnect with a stale low does not report a fake new low', (
   d.step(61_100);
   assert.equal(d.state(), 'ARMED'); // 101 > 100：新 ticker 到达后正常武装
   assert.deepEqual(d.fires, []);
+});
+
+// ---------- 5m 窗口 + 窗口 CVD（volume_delta） ----------
+
+test('windowMs: s/m/h 后缀统一换算，非法窗口直接报错', () => {
+  assert.equal(windowMs('1s'), 1_000);
+  assert.equal(windowMs('60s'), 60_000);
+  assert.equal(windowMs('5m'), 300_000);
+  assert.equal(windowMs('1h'), 3_600_000);
+  assert.throws(() => windowMs('5'));
+  assert.throws(() => windowMs('5d'));
+});
+
+const buy5m: MetricDef = { name: 'buy_notional_5m', kind: 'window', stream: 'aggTrade', window: '5m', filter: { buyer_is_maker: false }, field: 'notional', aggregation: 'sum' };
+const sell5m: MetricDef = { name: 'sell_notional_5m', kind: 'window', stream: 'aggTrade', window: '5m', filter: { buyer_is_maker: true }, field: 'notional', aggregation: 'sum' };
+const vd5m: MetricDef = { name: 'volume_delta_5m', kind: 'combine', op: 'diff', a: 'buy_notional_5m', b: 'sell_notional_5m' };
+const ret5m: MetricDef = { name: 'return_5m', kind: 'window', stream: 'aggTrade', window: '5m', filter: {}, field: 'price', aggregation: 'return' };
+
+test('requiredWindowMs: 5m 必须是 300s，不能被按秒解析成 5s（否则 5 秒就判就绪）', () => {
+  const v = validateSpec({
+    name: 'xpl-cvd', title: 'x', market: { exchange: 'binance', product: 'spot', symbol: 'XPLUSDT' },
+    metrics: [buy5m, sell5m, vd5m, ret5m],
+    condition: { op: 'and', conditions: [{ left: 'return_5m', operator: '>', right: { value: 0.02 } }, { left: 'volume_delta_5m', operator: '>', right: { value: 0 } }] },
+  });
+  assert.ok(v.ok, JSON.stringify(v));
+  assert.equal(requiredWindowMs(v.spec), 300_000);
+});
+
+test('volume_delta_5m: 5 分钟未连续接收前为 null，就绪后 = 买 - 卖，并按成交时间滑出', () => {
+  const w = new SymbolWindows();
+  w.markContinuous(0);
+  w.push(trade(10_000, 1, 1_000, false)); // 主动买 1000
+  w.push(trade(20_000, 1, 300, true)); // 主动卖 300
+  w.push(trade(200_000, 1.05, 100, true)); // 主动卖 105
+  w.advance(299_999);
+  // 只接收了不到 5 分钟：窗口不完整，必须是 null 而不是 595
+  assert.deepEqual(w.evaluate([buy5m, sell5m, vd5m]), { buy_notional_5m: null, sell_notional_5m: null, volume_delta_5m: null });
+  w.advance(305_000);
+  const v = w.evaluate([buy5m, sell5m, vd5m, ret5m]);
+  assert.equal(v.volume_delta_5m, 1000 - 405);
+  assert.ok(Math.abs((v.return_5m as number) - 0.05) < 1e-12);
+  w.advance(315_000); // 10s 的主动买滑出窗口
+  assert.equal(w.evaluate([buy5m, sell5m, vd5m]).volume_delta_5m, -405);
+  w.advance(325_000); // 20s 的主动卖也滑出
+  assert.equal(w.evaluate([buy5m, sell5m, vd5m]).volume_delta_5m, -105);
+});
+
+test('volume_delta: 涨价但 CVD 为负的背离条件可求值', () => {
+  const r = evaluateCondition(
+    { op: 'and', conditions: [{ left: 'return_5m', operator: '>', right: { value: 0 } }, { left: 'volume_delta_5m', operator: '<', right: { value: 0 } }] },
+    { return_5m: 0.01, volume_delta_5m: -2_000 },
+  );
+  assert.equal(r.passed, true);
+  assert.equal(r.complete, true);
+});
+
+test('catalog: 每个 combine 只引用排在它之前的指标，5m 与 volume_delta 已注册且描述可查', () => {
+  const seen = new Set<string>();
+  for (const m of CATALOG) {
+    if (m.kind === 'combine') for (const ref of [m.a, m.b]) assert.ok(seen.has(ref), `${m.name} → ${ref}`);
+    seen.add(m.name);
+  }
+  for (const n of ['return_5m', 'buy_notional_5m', 'sell_notional_5m', 'volume_delta_5m', 'volume_delta_10s']) assert.ok(seen.has(n), n);
+  assert.match(catalogDescription('volume_delta_5m'), /CVD/);
+  assert.equal(catalogDescription('return_5m'), catalogDescription('return_10s'));
+  const vd = CATALOG.find((m) => m.name === 'volume_delta_5m')!;
+  assert.equal(metricUnit(vd, CATALOG), 'USDT');
+  assert.equal(describeFormula(vd), 'buy_notional_5m - sell_notional_5m');
 });

@@ -35,7 +35,7 @@ Binance Signal Studio：自然语言 → Signal DSL → 确定性 Runtime（Bina
 6. **事件自包含**。`events` 表保存触发时的 `spec` 快照与每个叶子条件的左右值；Explain 只读快照，不读当前 Signal 定义。
 7. **Webhook 安全**：默认拒绝私有地址、不跟随重定向。不要为了方便测试去掉这些检查——用 `ALLOW_PRIVATE_WEBHOOKS=true`。
 8. 事件与投递日志**永久保留**，删除 Signal 不删它们。
-9. **长周期需求走 `kind:"ticker"`，不得退化成窗口近似**。aggTrade 窗口上限 60s，"24 小时新低"这类语义只能由 `<symbol>@ticker`（交易所侧维护的 24h 滚动统计，每秒下发、无预热）表达。两个配套约束：
+9. **长周期需求走 `kind:"ticker"`，不得退化成窗口近似**。aggTrade 窗口上限 5m（`WINDOWS` 末项；窗口时长一律经 `windowMs()` 换算，窗口名可带 s/m/h 后缀，禁止自行 `slice` 按秒解析），"24 小时新低"这类语义只能由 `<symbol>@ticker`（交易所侧维护的 24h 滚动统计，每秒下发、无预热）表达。两个配套约束：
    - ticker **不参与**成交窗口的时钟与预热（`nowEx` / `continuousSince` 仍只由 aggTrade 驱动），只更新快照；
    - 用到 ticker 的 Signal 必须等到**第一条 ticker 到达**才算就绪（`requiresTicker()`）。否则就绪瞬间 ticker 还是 null（条件假 → ARMED），下一秒 ticker 到达、条件转真，会被误判成边沿而触发，直接破坏不变量 5；
    - 断线时 ticker 快照随窗口一起作废（`markDisconnected()` 清空），重连后同样要等第一条新 ticker。旧快照不含断线期间的行情，拿它判就绪会把"断线期间已满足"的条件当成边沿触发，旧极值还会导致误报新低/新高；

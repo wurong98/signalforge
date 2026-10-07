@@ -139,6 +139,51 @@ test('rules: short-window sentences are unaffected by the 24h branch', () => {
   assert.equal(b.spec.metrics[0].kind, 'window');
 });
 
+test('rules: 分钟窗口映射到 5m，不再拼成非法的 300s', () => {
+  const s = parseWithRules('XPL 5 分钟涨幅超过 3%');
+  assert.ok(!('error' in s));
+  assert.equal(s.spec.market.symbol, 'XPLUSDT');
+  assert.deepEqual(s.spec.condition, { left: 'return_5m', operator: '>=', right: { value: 0.03 } });
+  assert.ok(validateSpec(s.spec).ok);
+  const n = parseWithRules('BTC 4 分钟涨 1%');
+  assert.ok(!('error' in n));
+  assert.equal(n.spec.metrics[0].kind === 'window' && n.spec.metrics[0].window, '5m');
+  assert.ok(n.assumptions.some((a) => a.includes('5m')));
+});
+
+test('rules: 噪声下限按窗口毫秒缩放，5m = 30 × 10s', () => {
+  const s = parseWithRules('XPL 5分钟主动买入是卖出的 2 倍');
+  assert.ok(!('error' in s));
+  assert.deepEqual((s.spec.condition as any).conditions[1], { left: 'buy_notional_5m', operator: '>=', right: { value: 150_000 } });
+});
+
+test('rules: 涨幅 + CVD 为正 → return_5m AND volume_delta_5m > 0，不会丢掉 CVD 条件', () => {
+  const s = parseWithRules('XPL 5 分钟涨幅超过 2%，同时 CVD 为正');
+  assert.ok(!('error' in s));
+  assert.ok(validateSpec(s.spec).ok);
+  assert.deepEqual(s.spec.condition, {
+    op: 'and',
+    conditions: [
+      { left: 'return_5m', operator: '>=', right: { value: 0.02 } },
+      { left: 'volume_delta_5m', operator: '>', right: { value: 0 } },
+    ],
+  });
+  assert.deepEqual(s.spec.metrics.map((m) => m.name), ['buy_notional_5m', 'sell_notional_5m', 'volume_delta_5m', 'return_5m']);
+});
+
+test('rules: 价格上涨但 CVD 为负 → return_5m > 0 AND volume_delta_5m < 0', () => {
+  const s = parseWithRules('XPL 5分钟价格上涨但 CVD 为负');
+  assert.ok(!('error' in s));
+  assert.ok(validateSpec(s.spec).ok);
+  assert.deepEqual(s.spec.condition, {
+    op: 'and',
+    conditions: [
+      { left: 'return_5m', operator: '>', right: { value: 0 } },
+      { left: 'volume_delta_5m', operator: '<', right: { value: 0 } },
+    ],
+  });
+});
+
 test('extractJson strips think blocks and fences', () => {
   assert.deepEqual(extractJson('<think>{"no":1}</think>\n```json\n{"a":{"b":1}}\n```'), { a: { b: 1 } });
 });

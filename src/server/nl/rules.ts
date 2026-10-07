@@ -3,9 +3,10 @@
  *   "BTC 10 秒主动买入金额超过主动卖出金额 3 倍时通知我"
  *   "ETH 5 秒内涨幅超过 0.2%"
  *   "BTC 创 24 小时新低时提醒我，每分钟最多一次"
+ *   "XPL 5 分钟涨幅超过 2% 且 CVD 为正" / "XPL 5 分钟上涨但 CVD 为负"
  */
 import type { MetricDef, SignalSpec, WindowSpec } from '../../shared/dsl.ts';
-import { WINDOWS } from '../../shared/dsl.ts';
+import { WINDOWS, windowMs } from '../../shared/dsl.ts';
 
 export interface ParseOutput {
   spec: SignalSpec;
@@ -14,7 +15,7 @@ export interface ParseOutput {
   parser: 'llm' | 'rules';
 }
 
-const KNOWN_BASES = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE', 'ADA', 'TRX', 'AVAX', 'LINK', 'TON', 'SUI', 'PEPE'];
+const KNOWN_BASES = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE', 'ADA', 'TRX', 'AVAX', 'LINK', 'TON', 'SUI', 'PEPE', 'XPL'];
 
 /** "24 小时 / 24h / 一天 / 日内" 这类长周期说法 */
 const PERIOD_24H = /(24\s*(?:小时|小時|h\b|hours?\b|hr)|24h|一天|日内)/i;
@@ -32,12 +33,13 @@ export function detectSymbol(text: string): { symbol: string; assumed: boolean }
 export function detectWindow(text: string): { window: WindowSpec; assumed: boolean; note?: string } {
   const m = text.match(/(\d+)\s*(秒|s\b|sec|seconds?|分钟|min|minutes?)/i);
   if (!m) return { window: '10s', assumed: true };
-  let sec = Number(m[1]);
-  if (/分|min/i.test(m[2])) sec *= 60;
-  const allowed = WINDOWS.map((w) => Number(w.slice(0, -1)));
-  if (allowed.includes(sec)) return { window: `${sec}s` as WindowSpec, assumed: false };
-  const nearest = allowed.reduce((a, b) => (Math.abs(b - sec) < Math.abs(a - sec) ? b : a));
-  return { window: `${nearest}s` as WindowSpec, assumed: true, note: `窗口 ${sec}s 不在支持列表，已取最接近的 ${nearest}s` };
+  let ms = Number(m[1]) * 1000;
+  if (/分|min/i.test(m[2])) ms *= 60;
+  // 按毫秒比较并返回 WINDOWS 里的原名：窗口名不全是"秒数 + s"（5m），不能拼 `${sec}s`
+  const exact = WINDOWS.find((w) => windowMs(w) === ms);
+  if (exact) return { window: exact, assumed: false };
+  const nearest = WINDOWS.reduce((a, b) => (Math.abs(windowMs(b) - ms) < Math.abs(windowMs(a) - ms) ? b : a));
+  return { window: nearest, assumed: true, note: `窗口 ${m[1]}${m[2]} 不在支持列表，已取最接近的 ${nearest}` };
 }
 
 /** DSL 上限：cooldown_ms ≤ 24h */
@@ -63,11 +65,11 @@ function detectCooldown(text: string): number | null {
  */
 export function noiseFloor(symbol: string, w: WindowSpec): number {
   const per10s = symbol.startsWith('BTC') ? 50_000 : symbol.startsWith('ETH') ? 20_000 : 5_000;
-  return Math.max(100, Math.round((per10s * Number(w.slice(0, -1))) / 10));
+  return Math.max(100, Math.round((per10s * windowMs(w)) / 10_000));
 }
 
 /**
- * 24h 档：aggTrade 窗口最长 60s，表达不了"24 小时新低"这类长周期需求，
+ * 24h 档：aggTrade 窗口最长 5m，表达不了"24 小时新低"这类长周期需求，
  * 必须用 <symbol>@ticker 的交易所侧 24h 滚动统计（每秒下发，收到第一条即有效，无需预热）。
  * 返回 null 表示不是 24h 档，交回窗口分支。
  */
@@ -163,7 +165,7 @@ export function parseWithRules(text: string): ParseOutput | { error: string } {
   const market = { exchange: 'binance' as const, product: 'spot' as const, symbol };
   const cooldown = detectCooldown(text) ?? 10_000;
 
-  // 24h 档先于窗口分支判断：否则"24 小时新低"会被降级成 60s 近似，语义完全不同
+  // 24h 档先于窗口分支判断：否则"24 小时新低"会被降级成短窗口近似，语义完全不同
   const t24 = parse24h(text, symbol, base, market, cooldown, assumptions);
   if (t24) return t24;
 
@@ -206,6 +208,10 @@ export function parseWithRules(text: string): ParseOutput | { error: string } {
     };
   }
 
+  // CVD 分支须先于纯涨幅分支：否则"涨 2% 且 CVD 为正"会命中下面的百分比句式，
+  // 静默丢掉 CVD 条件，生成一个只看涨幅的 Signal
+  if (/cvd|volume[\s_]*delta|主动净|净买|净卖/i.test(text)) return parseCvd(text, symbol, base, market, w, cooldown, assumptions);
+
   const pct = text.match(/(涨|跌|上涨|下跌|rise|drop|up|down)[^\d-]*(\d+(?:\.\d+)?)\s*%/i) ?? text.match(/(\d+(?:\.\d+)?)\s*%/);
   if (pct) {
     const num = Number(pct[2] ?? pct[1]);
@@ -230,4 +236,56 @@ export function parseWithRules(text: string): ParseOutput | { error: string } {
   }
 
   return { error: '规则解析器无法理解该描述。请配置 LLM（LLM_BASE_URL / LLM_API_KEY），或使用"X 秒主动买入超过卖出 N 倍"/"X 秒涨幅超过 N%"句式。' };
+}
+
+/**
+ * 窗口 CVD（volume_delta = 主动买入额 - 主动卖出额）与价格方向的组合。
+ * 价格部分：给了百分比就按阈值；只说"上涨/下跌"就取 > 0 / < 0；没提价格就只看 CVD。
+ */
+function parseCvd(
+  text: string,
+  symbol: string,
+  base: string,
+  market: SignalSpec['market'],
+  w: WindowSpec,
+  cooldown: number,
+  assumptions: string[],
+): ParseOutput {
+  const negative = /(cvd|delta)[^，,。;；]*?(为负|负值|转负|小于\s*0|<\s*0)|净卖|背离/i.test(text);
+  const buy: MetricDef = { name: `buy_notional_${w}`, kind: 'window', stream: 'aggTrade', window: w, filter: { buyer_is_maker: false }, field: 'notional', aggregation: 'sum' };
+  const sell: MetricDef = { name: `sell_notional_${w}`, kind: 'window', stream: 'aggTrade', window: w, filter: { buyer_is_maker: true }, field: 'notional', aggregation: 'sum' };
+  const delta: MetricDef = { name: `volume_delta_${w}`, kind: 'combine', op: 'diff', a: buy.name, b: sell.name };
+  const ret: MetricDef = { name: `return_${w}`, kind: 'window', stream: 'aggTrade', window: w, filter: {}, field: 'price', aggregation: 'return' };
+  const conditions: SignalSpec['condition'][] = [];
+  const pct = text.match(/(\d+(?:\.\d+)?)\s*%/);
+  const down = /跌|\bdrops?\b|\bdown\b/i.test(text);
+  const up = /涨|\brises?\b|\bup\b/i.test(text);
+  let priceDesc = '';
+  if (pct) {
+    const num = Number(pct[1]);
+    conditions.push(down ? { left: ret.name, operator: '<=', right: { value: -num / 100 } } : { left: ret.name, operator: '>=', right: { value: num / 100 } });
+    priceDesc = `${w} ${down ? '跌幅' : '涨幅'}达到 ${num}%`;
+  } else if (up || down) {
+    conditions.push({ left: ret.name, operator: down ? '<' : '>', right: { value: 0 } });
+    priceDesc = `${w} 价格${down ? '下跌' : '上涨'}`;
+  }
+  conditions.push({ left: delta.name, operator: negative ? '<' : '>', right: { value: 0 } });
+  const floor = noiseFloor(symbol, w);
+  assumptions.push(`CVD 按 ${w} 窗口计算（窗口内主动买卖净额），不是从启动起无限累计的绝对值`);
+  assumptions.push(`阈值取 0，成交清淡时符号容易在 0 附近来回翻转；如需过滤噪声可改为 ${negative ? '<' : '>'} ${negative ? '-' : ''}${floor.toLocaleString('en-US')} USDT 等绝对阈值`);
+  const tag = negative ? 'neg' : 'pos';
+  return {
+    parser: 'rules',
+    assumptions,
+    spec: {
+      name: `${base}-cvd-${tag}-${w}`,
+      title: `${base.toUpperCase()} ${priceDesc ? (down ? 'Drop' : 'Pump') + ' + ' : ''}CVD ${negative ? 'Negative' : 'Positive'} ${w}`,
+      description: text,
+      market,
+      metrics: priceDesc ? [buy, sell, delta, ret] : [buy, sell, delta],
+      condition: conditions.length === 1 ? conditions[0] : { op: 'and', conditions },
+      cooldown_ms: cooldown,
+    },
+    explanation: `在 ${symbol} 的 aggTrade 上统计最近 ${w} 的主动买入额 Σ(p×q | m=false) 与主动卖出额 Σ(p×q | m=true)，二者之差为窗口 CVD（volume_delta_${w}）；${priceDesc ? `${priceDesc}且` : ''}CVD ${negative ? '< 0（主动卖盘净流出）' : '> 0（主动买盘净流入）'}时触发。`,
+  };
 }

@@ -1,13 +1,14 @@
 /**
  * 内置指标目录：Explore 页面与 LLM Parser 共用。
  * 两类数据源：
- * - window：aggTrade 逐笔成交 + 本地滑动窗口（上限 60s，PRD §30 P0）
+ * - window：aggTrade 逐笔成交 + 本地滑动窗口（上限 5m；更长周期走 ticker 或日后注册 1h）
  * - ticker：<symbol>@ticker 的 24h 滚动统计，由交易所维护，长周期需求（24h 新低 / 24h 涨跌幅）只能靠它
  * depth / bookTicker 属于 P2。
  */
 import type { MetricDef, WindowSpec } from './dsl.ts';
+import { WINDOW_SUFFIX_RE } from './dsl.ts';
 
-const W: WindowSpec[] = ['1s', '5s', '10s', '30s', '60s'];
+const W: WindowSpec[] = ['1s', '5s', '10s', '30s', '60s', '5m'];
 
 function build(): MetricDef[] {
   const out: MetricDef[] = [
@@ -27,9 +28,12 @@ function build(): MetricDef[] {
     out.push(
       { name: `trade_imbalance_${w}`, kind: 'combine', op: 'imbalance', a: `buy_notional_${w}`, b: `sell_notional_${w}` },
       { name: `buy_sell_ratio_${w}`, kind: 'combine', op: 'ratio', a: `buy_notional_${w}`, b: `sell_notional_${w}` },
+      // 窗口 CVD：窗口内主动买卖净额。不提供从启动起无限累计的绝对 CVD——
+      // 它依赖启动时刻、重启即归零，无法写成可比较的阈值条件
+      { name: `volume_delta_${w}`, kind: 'combine', op: 'diff', a: `buy_notional_${w}`, b: `sell_notional_${w}` },
     );
   }
-  // 24h 滚动统计：交易所侧每秒下发，无预热、无 60s 窗口上限
+  // 24h 滚动统计：交易所侧每秒下发，无预热、无窗口上限
   out.push(
     { name: 'ticker_low_24h', kind: 'ticker', stream: 'ticker', field: 'low_24h' },
     { name: 'ticker_high_24h', kind: 'ticker', stream: 'ticker', field: 'high_24h' },
@@ -53,6 +57,7 @@ export const CATALOG_DESCRIPTIONS: Record<string, string> = {
   trade_count: '聚合成交笔数',
   trade_imbalance: '主动买卖失衡 (buy - sell) / (buy + sell)',
   buy_sell_ratio: '主动买入额 / 主动卖出额',
+  volume_delta: 'CVD（窗口）：主动买入额 - 主动卖出额，> 0 表示窗口内主动买盘净流入',
   ticker_low_24h: '24h 最低价（交易所滚动统计）',
   ticker_high_24h: '24h 最高价（交易所滚动统计）',
   ticker_change_pct_24h: '24h 涨跌幅',
@@ -60,6 +65,6 @@ export const CATALOG_DESCRIPTIONS: Record<string, string> = {
 };
 
 export function catalogDescription(name: string): string {
-  const base = name.replace(/_(\d+s)$/, '');
+  const base = name.replace(WINDOW_SUFFIX_RE, '');
   return CATALOG_DESCRIPTIONS[base] ?? CATALOG_DESCRIPTIONS[name] ?? '';
 }

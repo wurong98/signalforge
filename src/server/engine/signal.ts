@@ -17,7 +17,7 @@
  * 即：每次触发必须对应一次"未满足 → 满足"的边沿，且两次触发间隔 ≥ cooldown。
  */
 import type { Condition, LeafCondition, Operator, SignalSpec } from '../../shared/dsl.ts';
-import { describeCondition, describeOperand, isLeaf } from '../../shared/dsl.ts';
+import { describeCondition, describeOperand, isLeaf, windowMs } from '../../shared/dsl.ts';
 import type { MetricValue } from './window.ts';
 
 export type SignalState = 'WARMING' | 'ARMED' | 'COOLDOWN' | 'ACTIVE';
@@ -135,7 +135,7 @@ export class SignalStateMachine {
 
 export function requiredWindowMs(spec: SignalSpec): number {
   let ms = 0;
-  for (const m of spec.metrics) if (m.kind === 'window') ms = Math.max(ms, Number(m.window.slice(0, -1)) * 1000);
+  for (const m of spec.metrics) if (m.kind === 'window') ms = Math.max(ms, windowMs(m.window));
   return ms;
 }
 
