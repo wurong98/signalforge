@@ -29,6 +29,9 @@ test('auth: 未设置密码时同样拦截所有 /api，静态资源放行', asy
     assert.equal((await app.inject('/api/signals')).statusCode, 401);
     assert.equal((await app.inject('/api/live')).statusCode, 401);
     assert.equal((await app.inject('/api/signals?x=1')).statusCode, 401);
+    // 编码过的路径会被路由器解码后命中 /api 路由，必须同样拦截
+    assert.equal((await app.inject('/%61pi/signals')).statusCode, 401);
+    assert.equal((await app.inject('/api%2Fsignals')).statusCode, 404);
     assert.equal((await app.inject('/index.html')).statusCode, 200);
     assert.deepEqual((await app.inject('/api/auth/status')).json(), { configured: false, authenticated: false });
     // 未设置时不能登录

@@ -166,8 +166,10 @@ const PasswordBody = z.object({ password: z.string().max(256) });
 
 export function registerAuth(app: FastifyInstance, auth: Auth) {
   app.addHook('onRequest', async (req, reply: FastifyReply) => {
-    const path = req.url.split('?')[0];
-    if (!path.startsWith('/api/') || PUBLIC_PATHS.has(path)) return;
+    // 按实际命中的路由判断，不看原始 URL：路由器会先解码再匹配，
+    // `/%61pi/signals` 前缀不是 `/api/`，却会命中 `/api/signals`，按 URL 判断会被绕过
+    const route = req.routeOptions.url ?? '';
+    if (!route.startsWith('/api/') || PUBLIC_PATHS.has(route)) return;
     if (!auth.isAuthenticated(req)) return reply.code(401).send({ errors: ['需要输入管理密码'] });
   });
 
