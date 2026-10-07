@@ -70,6 +70,9 @@ Hard rules:
 5. State facts only. No price predictions, no buy/sell advice — decline politely if asked.
 6. If coverage_pct is well below 100, mention that the range has gaps.
 7. Symbols are full Binance spot pairs (BTC => BTCUSDT unless the user names another quote).
+8. "Supported" vs "subscribed": every TRADING Binance Spot pair is supported (search_binance_symbols); only subscribed pairs
+   (list_symbols) have live metrics right now. When asked which pairs are supported / whether a coin can be monitored, answer
+   with search_binance_symbols, and mention which are already subscribed.
 
 Metrics (window suffix in braces; windows slide on exchange trade time; tools already convert percent metrics to %):
 ${catalogSummary()}
@@ -127,7 +130,7 @@ export async function runChat(turns: ChatTurn[], deps: { call: LlmCall; tools: T
     }
     messages.push({ role: 'assistant', content: msg.content ?? null, tool_calls: msg.tool_calls });
     for (const c of msg.tool_calls) {
-      const r = runTool(c.function.name, c.function.arguments ?? '', deps.tools);
+      const r = await runTool(c.function.name, c.function.arguments ?? '', deps.tools);
       trace.push({ tool: c.function.name, args: r.args, result: r.result, ok: r.ok });
       messages.push({ role: 'tool', tool_call_id: c.id, content: clip(JSON.stringify(r.result), MAX_RESULT_CHARS) });
     }

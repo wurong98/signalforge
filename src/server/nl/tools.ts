@@ -9,6 +9,7 @@
 import { z } from 'zod';
 import { CATALOG, CATALOG_BY_NAME } from '../../shared/catalog.ts';
 import { SYMBOL_RE, describeCondition, describeFormula, metricUnit } from '../../shared/dsl.ts';
+import type { SymbolDirectory } from '../binance/symbols.ts';
 import type { Db } from '../db.ts';
 import type { Runtime } from '../engine/runtime.ts';
 import type { LlmTool } from './llm.ts';
@@ -21,6 +22,8 @@ export interface ToolDeps {
   now: () => number;
   /** 用户时区（IANA），输出时间按它格式化 */
   tz: string;
+  /** 币安现货交易对目录（exchangeInfo）；未提供时 search_binance_symbols 报不可用 */
+  directory?: Pick<SymbolDirectory, 'list'>;
 }
 
 const DAY = 86_400_000;
@@ -104,7 +107,7 @@ interface ToolDef<S extends z.ZodObject> {
   name: string;
   description: string;
   schema: S;
-  run: (args: z.infer<S>, deps: ToolDeps) => ToolResult;
+  run: (args: z.infer<S>, deps: ToolDeps) => ToolResult | Promise<ToolResult>;
 }
 const def = <S extends z.ZodObject>(t: ToolDef<S>) => t as unknown as ToolDef<z.ZodObject>;
 
@@ -116,7 +119,9 @@ const SNAPSHOT_DEFAULT = [
 export const TOOLS = [
   def({
     name: 'list_symbols',
-    description: 'Subscribed symbols with readiness, last trade and 24h ticker. Only these symbols have metrics.',
+    description:
+      'Symbols SUBSCRIBED right now (have live metrics), with readiness, last trade and 24h ticker. ' +
+      'This is NOT the list of supported symbols — use search_binance_symbols for that.',
     schema: z.object({}),
     run: (_a, d) => ({
       symbols: d.runtime.symbols().map((s) => ({
@@ -126,11 +131,50 @@ export const TOOLS = [
         ticker_24h: s.ticker_24h
           ? {
               last: sig(s.ticker_24h.last), high: sig(s.ticker_24h.high), low: sig(s.ticker_24h.low),
-              change_pct: sig(s.ticker_24h.change_pct * 100), updated: fmtTime(s.ticker_24h.E, d.tz),
+              change_pct: sig(s.ticker_24h.change_pct * 100),
+              quote_volume: present('ticker_quote_volume_24h', d.runtime.snapshot(s.symbol, ['ticker_quote_volume_24h']).ticker_quote_volume_24h).value,
+              updated: fmtTime(s.ticker_24h.E, d.tz),
             }
           : null,
       })),
     }),
+  }),
+
+  def({
+    name: 'search_binance_symbols',
+    description:
+      'Binance Spot pairs currently TRADING (from exchangeInfo) — i.e. what the user CAN monitor. Any of them can get a Signal; ' +
+      'creating a Signal subscribes it automatically, and only then do metrics exist. Filter by base asset / symbol text and quote asset.',
+    schema: z.object({
+      query: z.string().trim().toUpperCase().max(20).optional().describe('base asset or symbol fragment, e.g. XPL, PEPE; omit for totals only'),
+      quote: z.string().trim().toUpperCase().max(10).default('USDT').describe('quote asset filter; "ALL" for any'),
+    }),
+    run: async (a, d) => {
+      if (!d.directory) throw new ToolError({ error: 'unavailable', message: 'Binance symbol directory is not available.' });
+      let all;
+      try {
+        all = await d.directory.list();
+      } catch (e) {
+        throw new ToolError({ error: 'unavailable', message: `Cannot reach Binance exchangeInfo: ${(e as Error).message}` });
+      }
+      const subscribed = new Set(d.runtime.symbols().map((s) => s.symbol));
+      const inQuote = a.quote === 'ALL' ? all : all.filter((s) => s.quote === a.quote);
+      const hits = a.query ? inQuote.filter((s) => s.base === a.query || s.symbol.includes(a.query!)) : [];
+      // 精确匹配 base 的排前面
+      hits.sort((x, y) => Number(y.base === a.query) - Number(x.base === a.query) || x.symbol.localeCompare(y.symbol));
+      const quotes = new Map<string, number>();
+      for (const s of all) quotes.set(s.quote, (quotes.get(s.quote) ?? 0) + 1);
+      return {
+        total_trading_spot: all.length,
+        top_quotes: [...quotes].sort((x, y) => y[1] - x[1]).slice(0, 6).map(([quote, count]) => ({ quote, count })),
+        quote_filter: a.quote,
+        in_quote: inQuote.length,
+        ...(a.query
+          ? { query: a.query, match_count: hits.length, matches: hits.slice(0, 30).map((s) => ({ symbol: s.symbol, subscribed: subscribed.has(s.symbol) })) }
+          : {}),
+        subscribed: [...subscribed],
+      };
+    },
   }),
 
   def({
@@ -350,7 +394,7 @@ export function llmTools(): LlmTool[] {
 }
 
 /** 执行一次工具调用：参数校验失败 / 工具报错都作为结果回灌给 LLM，而不是中断对话 */
-export function runTool(name: string, rawArgs: string, deps: ToolDeps): { args: unknown; result: ToolResult; ok: boolean } {
+export async function runTool(name: string, rawArgs: string, deps: ToolDeps): Promise<{ args: unknown; result: ToolResult; ok: boolean }> {
   const t = TOOL_BY_NAME.get(name);
   if (!t) return { args: rawArgs, result: { error: 'unknown_tool', name, available: TOOLS.map((x) => x.name) }, ok: false };
   let parsed: unknown;
@@ -362,7 +406,7 @@ export function runTool(name: string, rawArgs: string, deps: ToolDeps): { args: 
   const v = t.schema.safeParse(parsed);
   if (!v.success) return { args: parsed, result: { error: 'bad_args', issues: v.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`) }, ok: false };
   try {
-    return { args: v.data, result: t.run(v.data, deps), ok: true };
+    return { args: v.data, result: await t.run(v.data, deps), ok: true };
   } catch (e) {
     if (e instanceof ToolError) return { args: v.data, result: e.payload, ok: false };
     return { args: v.data, result: { error: 'internal', message: (e as Error).message }, ok: false };

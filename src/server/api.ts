@@ -4,6 +4,7 @@ import type { ServerBuild } from '../shared/build.ts';
 import { CATALOG, CATALOG_BY_NAME, catalogDescription } from '../shared/catalog.ts';
 import { SYMBOL_RE, WebhookInputSchema, describeFormula, metricUnit, validateSpec } from '../shared/dsl.ts';
 import type { BinanceHub } from './binance/stream.ts';
+import { SymbolDirectory } from './binance/symbols.ts';
 import { config } from './config.ts';
 import type { Db } from './db.ts';
 import type { Runtime } from './engine/runtime.ts';
@@ -86,6 +87,7 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
   });
   // 每次对话最多 7 次 LLM 调用，限制并发避免把额度打满
   let chatInFlight = 0;
+  const directory = new SymbolDirectory(config.binanceRest);
   app.post('/api/chat', async (req, reply) => {
     if (!config.llm) return bad(reply, '未配置 LLM（LLM_BASE_URL / LLM_API_KEY），助手不可用；创建 Signal 请用 Create 页（规则解析）', 503);
     const body = ChatBody.safeParse(req.body);
@@ -95,7 +97,7 @@ export function registerApi(app: FastifyInstance, deps: { db: Db; runtime: Runti
     try {
       return await runChat(body.data.messages, {
         call: llmCaller(config.llm),
-        tools: { runtime, db, retentionDays: config.metricRetentionDays, now: Date.now, tz: safeTz(body.data.tz) },
+        tools: { runtime, db, directory, retentionDays: config.metricRetentionDays, now: Date.now, tz: safeTz(body.data.tz) },
         signal: AbortSignal.timeout(90_000),
       });
     } catch (e) {
