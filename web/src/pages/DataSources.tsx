@@ -128,6 +128,8 @@ function AllSymbols() {
   }, [inMarket]);
   const query = q.trim().toUpperCase();
   const shown = inMarket.filter((r) => (quote === 'ALL' || r.quote === quote) && (!query || r.key.includes(query)));
+  // 筛选条件挡住了搜索结果时（如 ANTHROPICUSDT 只有合约、筛选停在现货），提示别处的匹配，避免误以为不存在
+  const elsewhere = query && !shown.length ? (rows ?? []).filter((r) => r.key.includes(query)) : [];
 
   return (
     <div className="card">
@@ -155,12 +157,19 @@ function AllSymbols() {
           </div>
           <div className="symbol-grid mono small">
             {shown.map((r) => (
-              <span key={r.key} className={r.subscribed ? 'ok-text' : undefined} title={r.contract === 'TRADIFI_PERPETUAL' ? 'TradFi 永续' : undefined}>
+              <span key={r.key} className={r.subscribed ? 'ok-text' : undefined} title={r.contract === 'TRADIFI_PERPETUAL' ? `${r.key}（TradFi 永续）` : r.key}>
                 {r.subscribed ? '● ' : ''}{r.key}{r.contract === 'TRADIFI_PERPETUAL' ? ' ·TradFi' : ''}
               </span>
             ))}
             {!shown.length && <span className="muted">无匹配</span>}
           </div>
+          {elsewhere.length > 0 && (
+            <p className="small">
+              当前筛选外有 {elsewhere.length} 个匹配：
+              <span className="mono">{elsewhere.slice(0, 5).map((r) => r.key).join('、')}{elsewhere.length > 5 ? ' …' : ''}</span>{' '}
+              <button className="ghost small" onClick={() => { setMarket('all'); setQuote('ALL'); }}>在全部市场中显示</button>
+            </p>
+          )}
         </>
       )}
     </div>

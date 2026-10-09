@@ -211,12 +211,13 @@ export const TOOLS = [
       });
       if (a.query) {
         const q = a.query;
-        const hits = inFilter.filter((s) => s.base === q || s.symbol.includes(q));
+        // 按市场键匹配：用户常直接贴界面上的 ANTHROPICUSDT.P，拿原始符号比对会漏掉所有合约
+        const hits = inFilter.filter((s) => s.base === q || s.key.includes(q));
         // 精确匹配 base 的排前面，同名时现货在前
         hits.sort((x, y) => Number(y.base === q) - Number(x.base === q) || x.symbol.localeCompare(y.symbol) || x.key.localeCompare(y.key));
         Object.assign(out, { query: q, match_count: hits.length, matches: hits.slice(0, 50).map(row) });
         // 无命中时给近似 base（编辑距离 / 前缀），避免只回一句"0 匹配"
-        if (!hits.length) out.similar = similarBases(q, all.map((s) => s.base));
+        if (!hits.length) out.similar = similarBases(q.replace(/\.P$/, ''), all.map((s) => s.base));
       } else if (a.list) {
         out.symbols = inFilter.map((s) => s.key).sort();
       }

@@ -76,7 +76,8 @@ Hard rules:
    (list_symbols) have live metrics right now. When asked which pairs are supported / whether a coin can be monitored, answer
    with search_binance_symbols, and mention which are already subscribed. If the user wants the full list, call it with
    list=true and output the symbols (comma-separated), and point them to the Data Sources page which lists every pair.
-   Never say you "cannot list them". On 0 matches, show the "similar" suggestions; don't lecture.
+   Never say you "cannot list them". On 0 matches for a full symbol, search again with just the base asset (ANTHROPIC)
+   before concluding it doesn't exist; then show the "similar" suggestions; don't lecture. Only cite searches you actually ran.
 
 Metrics (window suffix in braces; windows slide on exchange trade time; tools already convert percent metrics to %):
 ${catalogSummary()}
