@@ -213,4 +213,6 @@ label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color:
   .delivery { grid-template-columns: 90px 40px 40px 60px 1fr; }
 }
 
-.symbol-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 4px 12px; margin-top: 12px; max-height: 480px; overflow-y: auto; }
+.symbol-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 4px 12px; margin-top: 12px; max-height: 480px; overflow-y: auto; }
+/* 长名称（ANTHROPICUSDT.P ·TradFi）不折行，超长截断，完整名称见 title */
+.symbol-grid > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

@@ -173,6 +173,11 @@ test('tools: search_binance_symbols 同时覆盖 U 本位永续（含 TradFi）�
   const q = (await call(deps, 'search_binance_symbols', { query: 'QQQ' })).result as any;
   assert.deepEqual(q.matches, [{ symbol: 'QQQUSDT.P', market: 'futures', tradfi: true, subscribed: false }]);
   assert.equal(q.total_trading_futures_perpetual, 2);
+  // 直接用带 .P 的市场键搜索也能命中合约，且不会命中同名现货
+  const pk = (await call(deps, 'search_binance_symbols', { query: 'qqqusdt.p' })).result as any;
+  assert.deepEqual(pk.matches.map((m: any) => m.symbol), ['QQQUSDT.P']);
+  const bk = (await call(deps, 'search_binance_symbols', { query: 'BTCUSDT.P' })).result as any;
+  assert.deepEqual(bk.matches.map((m: any) => m.symbol), ['BTCUSDT.P']);
   // 同名交易对两个市场都列出，现货在前；已订阅按市场键判断
   const b = (await call(deps, 'search_binance_symbols', { query: 'BTC' })).result as any;
   assert.deepEqual(b.matches.map((m: any) => [m.symbol, m.subscribed]), [['BTCUSDT', true], ['BTCUSDT.P', false]]);
